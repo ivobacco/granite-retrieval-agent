@@ -1,18 +1,17 @@
 """
-requirements:  ag2==0.7.5, ag2[ollama]==0.7.05
+requirements:  ag2==0.9.6, ag2[ollama]==0.9.6
 """
 
 from fastapi import Request
-from datetime import date, datetime
-from autogen import coding, ConversableAgent
-from typing import Annotated, Any, Optional, Callable, Awaitable
+from autogen import ConversableAgent
+from typing import Annotated, Optional, Callable, Awaitable
 from open_webui.routers import retrieval
 from open_webui.models.knowledge import KnowledgeTable
 from open_webui import config as open_webui_config
 from pydantic import BaseModel, Field
+import asyncio
 import json
 import logging
-import traceback
 from langchain_community.utilities import SearxSearchWrapper
 
 ####################
@@ -43,9 +42,11 @@ ASSISTANT_PROMPT = """You are an AI assistant.
 
     # Tool Use
     You have access to the following tools. Only use these available tools and do not attempt to use anything not listed - this will cause an error.
-    Respond in the format: <function_call> {"name": function name, "arguments": dictionary of argument name and its value}. Do not use variables.
+    Respond in the format: <|tool_call|>{"name": function name, "arguments": dictionary of argument name and its value}. Do not use variables.
     Only call one tool at a time.
-    When suggesting tool calls, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.
+    When you are using knowledge and web search tools to complete the instruction, answer the instruction only using the results from the search; do no supplement with your own knowledge.
+    Never answer the instruction using links to URLs that were not discovered during the use of your search tools. Only respond with document links and URLs that your tools returned to you.
+    Also make sure to provide the URL for the page you are using as your source or the document name.
     """
 
 GOAL_JUDGE_PROMPT = """You are a judge. Your job is to carefully inspect whether a stated goal has been **fully met**, based on all of the requirements of the provided goal, the plans drafted to achieve it, and the information gathered so far.
@@ -117,11 +118,11 @@ STEP_CRITIC_PROMPT = """The previous instruction was {last_step} \nThe following
 
 class Pipe:
     class Valves(BaseModel):
-        TASK_MODEL_ID: str = Field(default="granite3.2:8b")
+        TASK_MODEL_ID: str = Field(default="granite3.3:8b")
         VISION_MODEL_ID: str = Field(default="granite3.2-vision:2b")
         OPENAI_API_URL: str = Field(default="http://localhost:11434")
         OPENAI_API_KEY: str = Field(default="ollama")
-        VISION_API_URL: str = Field(default="http://localhost:11434")
+        VISION_API_URL: str = Field(default="http://localhost:11434/v1")
         MODEL_TEMPERATURE: float = Field(default=0)
         MAX_PLAN_STEPS: int = Field(default=6)
 
@@ -143,6 +144,7 @@ class Pipe:
         message = str(body[-1])
 
         prompt_templates = {
+            "### Task",
             open_webui_config.DEFAULT_RAG_TEMPLATE.replace("\n", "\\n"),
             open_webui_config.DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE.replace(
                 "\n", "\\n"
@@ -210,8 +212,6 @@ class Pipe:
                     "model": default_model,
                     "client_host": base_url,
                     "api_type": "ollama",
-                    "cache_seed": None,
-                    "price": [0.0, 0.0],
                     "temperature": model_temp,
                     "num_ctx": 131072,
                 }
@@ -227,8 +227,6 @@ class Pipe:
                     "model": default_model,
                     "client_host": base_url,
                     "api_type": "ollama",
-                    "cache_seed": None,
-                    "price": [0.0, 0.0],
                     "temperature": model_temp,
                     "num_ctx": 131072,
                     "response_format": Plan,
@@ -240,12 +238,9 @@ class Pipe:
             "config_list": [
                 {
                     "model": vision_model,
-                    "client_host": vision_url,
-                    "api_type": "ollama",
-                    "cache_seed": None,
-                    "price": [0.0, 0.0],
-                    "temperature": model_temp,
-                    "num_ctx": 131072,
+                    "base_url": vision_url,
+                    "api_type": "openai",
+                    "api_key": api_key
                 }
             ],
         }
@@ -313,16 +308,11 @@ class Pipe:
         )
 
         # User Proxy chats with assistant on behalf of user and executes tools
-        code_exec = coding.LocalCommandLineCodeExecutor(
-            timeout=10,
-            work_dir="code_exec",
-        )
         user_proxy = ConversableAgent(
             name="User",
             human_input_mode="NEVER",
-            code_execution_config={"executor": code_exec},
             is_termination_msg=lambda msg: "##ANSWER##" in msg["content"]
-            or "## Answser" in msg["content"]
+            or "## Answer" in msg["content"]
             or "##TERMINATE##" in msg["content"]
             or ("tool_calls" not in msg and msg["content"] == ""),
         )
@@ -437,7 +427,7 @@ class Pipe:
             ]
             image_description = await vision_assistant.a_generate_reply(messages=messages)
             image_descriptions.append(
-                f"Accompanying image description: {image_description['content']}"
+                f"Accompanying image description: {image_description}"
             )
 
         # Instructions going forward are a conglameration of user input text and image description
