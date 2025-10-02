@@ -1,5 +1,5 @@
 """
-requirements:  ag2==0.9.6, ag2[ollama]==0.9.6
+requirements:  ag2==0.9.9, ag2[ollama]==0.9.9, ag2[openai]==0.9.9
 """
 
 from fastapi import Request
