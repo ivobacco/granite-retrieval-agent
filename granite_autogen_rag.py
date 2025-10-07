@@ -1,5 +1,5 @@
 """
-requirements:  ag2==0.9.9, ag2[ollama]==0.9.9, ag2[openai]==0.9.9
+requirements:  ag2==0.9.10, ag2[ollama]==0.9.10, ag2[openai]==0.9.10
 """
 
 from fastapi import Request
@@ -9,79 +9,124 @@ from open_webui.routers import retrieval
 from open_webui.models.knowledge import KnowledgeTable
 from open_webui import config as open_webui_config
 from pydantic import BaseModel, Field
-import asyncio
 import json
 import logging
-from langchain_community.utilities import SearxSearchWrapper
 
 ####################
 # Assistant prompts
 ####################
-PLANNER_MESSAGE = """You are a task planner. You will be given some information your job is to think step by step and enumerate the steps to complete a given task, using the provided context to guide you.
-    You will not execute the steps yourself, but provide the steps to a helper who will execute them. Make sure each step consists of a single operation, not a series of operations. The helper has the following capabilities:
-    1. Search through a collection of documents provided by the user. These are the user's own documents and will likely not have latest news or other information you can find on the internet.
-    2. Synthesize, summarize and classify the information received.
-    3. Search the internet
-    The plan may have as little or as many steps as is necessary to accomplish the given task.
+PLANNER_MESSAGE = """You are a coarse-grained task planner for data gathering. You will be given a user's goal your job is to enumerate the coarse-grained steps to gather any data necessary needed to accomplish the goal.
+You will not execute the steps yourself, but provide the steps to a helper who will execute them. The helper has to the following tools to help them accomplish tasks:
+1. Search through a collection of documents provided by the user. These are the user's own documents and will likely not have latest news or other information you can find on the internet.
+2. Given a question/topic, search the internet for resources to address question/topic (you don't need to formulate search queries, the tool will do it for you)
+Do not include steps for summarizing or synthesizing data. That will be done by another helper later, once all the data is gathered.
 
-    You may use any of the capabilties that the helper has, but you do not need to use all of them if they are not required to complete the task.
-    For example, if the task requires knowledge that is specific to the user, you may choose to include a step that searches through the user's documents. However, if the task only requires information that is available on the internet, you may choose to include a step that searches the internet and omit document searching.
-    """
+You may use any of the capabilities that the helper has, but you do not need to use all of them if they are not required to complete the task.
+For example, if the task requires knowledge that is specific to the user, you may choose to include a step that searches through the user's documents. However, if the task only requires information that is available on the internet, you may choose to include a step that searches the internet and omit document searching.
 
-ASSISTANT_PROMPT = """You are an AI assistant.
-    When you receive a message, figure out a solution and provide a final answer. The message will be accompanied with contextual information. Use the contextual information to help you provide a solution.
-    Make sure to provide a thorough answer that directly addresses the message you received.
-    If tool calls are used, **include ALL retrieved details** from the tool results.
-    **DO NOT summarize** multiple sources into a single explanation—**instead, cite each source individually**.
-    When citing sources returned from tool calls, you must always provide the source URL or the source document name.
-    When you are using knowledge and web search tools to complete the instruction, answer the instruction only using the results from the search; do no supplement with your own knowledge.
-    Be persistent in finding the information you need before giving up.
-    If the task is able to be accomplished without using tools, then do not make any tool calls.
-    When you have accomplished the instruction posed to you, you will reply with the text: ##ANSWER## - followed with an answer.
-    Important: If you are unable to accomplish the task, whether it's because you could not retrieve sufficient data, or any other reason, reply only with ##TERMINATE##.
+Keep the steps simple and geared towards using the tools for data collection. Below are some examples.
 
-    # Tool Use
-    You have access to the following tools. Only use these available tools and do not attempt to use anything not listed - this will cause an error.
-    Respond in the format: <|tool_call|>{"name": function name, "arguments": dictionary of argument name and its value}. Do not use variables.
-    Only call one tool at a time.
-    When you are using knowledge and web search tools to complete the instruction, answer the instruction only using the results from the search; do no supplement with your own knowledge.
-    Never answer the instruction using links to URLs that were not discovered during the use of your search tools. Only respond with document links and URLs that your tools returned to you.
-    Also make sure to provide the URL for the page you are using as your source or the document name.
-    """
+Example 1:
+User Input: Summarize the experiment results in StudyA.doc and integrate them with the latest peer-reviewed articles on similar topics you find online.
+Plan: ["Fetch experiment results from StudyA.doc in local knowledge store",
+"For each experiment result, search the internet for peer reviewed articles that cover similar topics to the experiment"]
 
-GOAL_JUDGE_PROMPT = """You are a judge. Your job is to carefully inspect whether a stated goal has been **fully met**, based on all of the requirements of the provided goal, the plans drafted to achieve it, and the information gathered so far.
+Example 2:
+User Input: Create a background report comparing our company’s last annual ESG performance with current sustainability regulations.
+Plan: [
+"Fetch last annual ESG performance data from the user's documents",
+"Search the internet for the latest sustainability regulations and reporting requirements"
+]
 
-## **STRICT INSTRUCTIONS**  
-- You **must provide exactly one response**—either **##YES##** or **##NOT YET##**—followed by a brief explanation.  
-- If **any** part of the goal remains unfulfilled, respond with **##NOT YET##**.  
-- If and only if **every single requirement** has been met, respond with **##YES##**.  
-- Your explanation **must be concise (1-2 sentences)** and clearly state the reason for your decision.  
-- **Do NOT attempt to fulfill the goal yourself.**  
-- If the goal involves gathering specific information (e.g., fetching internet articles) and this has **not** been done, respond with **##NOT YET##**.  
+Example 3:
+User Input: Gather current statistics on electric vehicle adoption rates in Europe and government incentive programs.
+[
+"Search the internet for recent statistics on electric vehicle adoption rates in Europe",
+"Search the internet for information about government incentive programs for electric vehicles in European countries"
+]
 
-    **OUTPUT FORMAT:**  
-    ```
-    ##YES## or ##NOT YET##      
-    Explanation: [Brief reason why this conclusion was reached]
-    ```
 
-    **INPUT FORMAT (JSON):**
+User Input: Retrieve all internal meeting notes and task logs related to the Alpha Project post-mortem.
+[
+"Search through the user's documents for all meeting notes and task logs related to the Alpha Project post-mortem"
+]
+"""
+
+ASSISTANT_PROMPT = """
+You are an AI assistant that must complete a single user task.
+
+INPUTS
+- "Instruction:" — the task to complete. This has the highest priority.
+- "Contextual Information:" — background that may include data, excerpts, or pre-fetched search results. Treat this as allowed evidence you may quote/summarize. It can be used even if you do not call any tools.
+
+GENERAL POLICY
+1) Follow "Instruction" over any conflicting context.
+2) If the task can be done with the provided inputs (Instruction + Contextual Information), DO NOT call tools.
+3) If essential info is missing and the task requires external facts, call exactly one tool at a time. Prefer a single decisive call over many speculative ones.
+4) When you use tools, ground your answer ONLY in tool or provided-context outputs. Do not add unsupported facts.
+5) If you still cannot complete the task after the allowed attempts, explain why and terminate.
+
+STRUCTURE & OUTPUT
+- Always produce one of:
+  a) ##ANSWER## <your final answer>   (no headers before it)
+  b) ##TERMINATE##   (only if truly impossible to complete)
+- If using tools or provided excerpts as sources, include a brief "Sources:" line with identifiers (e.g., [1], [2]) that map to the Contextual Information or tool-returned items.
+
+DECISION CHECKLIST (run mentally before answering)
+- Q1: Can I answer directly from Instruction + Contextual Information? If yes → answer now (no tools).
+- Q2: Is a tool REQUIRED to fetch missing facts? If yes → make one focused tool call that will likely resolve the task.
+- Q3: After a tool call, do I have enough to answer? If yes → answer now. If not → at most 2 more targeted calls. Then either answer or terminate with a clear reason.
+
+ERROR & MISSING-INFO HANDLING
+- If inputs are vague but still permit a reasonable interpretation, make the best good-faith assumption and proceed (state assumptions briefly in the answer).
+
+STYLE
+- Be direct, specific, and avoid boilerplate.
+
+TOOL USE RULES
+- Use only the tools provided here. Only one tool at a time.
+- Cite from tool outputs or provided context; do not mix in outside knowledge.
+- Stop after a maximum of 3 total tool calls.
+
+TERMINATION RULE
+- If after following the above you cannot satisfy the Instruction, output only:
+  ##TERMINATE##
+"""
+
+GOAL_JUDGE_PROMPT = """
+You are a strict and objective judge. Your task is to determine whether the original goal has been **fully and completely fulfilled**, based on the goal itself, the planned steps, the steps taken, and the information gathered.
+
+## EVALUATION RULES
+- You must provide:
+  1. A **binary decision** (`True` or `False`), and
+  2. A **1–2 sentence explanation** that clearly states the decisive reason.
+- **Every single requirement** of the goal must be satisfied for the decision to be `True`.
+- If **any part** of the goal or planned steps remains unfulfilled, return `False`.
+- Do **not** attempt to fulfill the goal yourself — only evaluate what has been done.
+
+## HOW TO JUDGE
+1. **Understand the Goal:** Identify what exactly is required to consider the goal fully met.
+3. **Check Information Coverage:** Verify whether the data in “Information Gathered” is:
+   - Sufficient in quantity and relevance to address the full goal;
+   - Not just references to actions, but actual collected content.
+
+
+## INPUT FORMAT (JSON)
     ```
     {
-        "Goal": "The ultimate goal/instruction to be fully fulfilled, along with any accompanying images that may provide further context.",
+        "Goal": "The ultimate goal/instruction to be fully fulfilled.",
         "Media Description": "If the user provided an image to supplement their instruction, a description of the image's content."
-        "Plan": "The plan to achieve the goal, including any sub-goals or tasks that need to be completed.",
-        "Information Gathered": "The information collected so far in pursuit of fulfilling the goal."
+        "Originally Planned Steps: ": "The plan to achieve the goal, all of the steps may or may not have been executed so far. It may be the case that not all the steps need to be executed in order to achieve the goal, but use this as a consideration.",
+        "Steps Taken so far": "All steps that have been taken so far",
+        "Information Gathered": "The information collected so far in pursuit of fulfilling the goal. This is the most important piece of information in deciding whether the goal has been met."
     }
     ```
+"""
 
-## **REMEMBER:**  
-- **Provide only ONE response**: either **##YES##** or **##NOT YET##**.  
-- The explanation must be **concise**—no more than **1-2 sentences**.  
-- **If even a small part of the goal is unfulfilled, reply with ##NOT YET##.**  
-    """
-
-REFLECTION_ASSISTANT_PROMPT = """You are a strategic planner focused on executing sequential steps to achieve a given goal. You will receive data in JSON format containing the current state of the plan and its progress. Your task is to determine the single next step, ensuring it aligns with the overall goal and builds upon the previous steps.
+REFLECTION_ASSISTANT_PROMPT = """You are a strategic planner focused on choosing the next step in a sequence of steps to achieve a given goal. 
+You will receive data in JSON format containing the current state of the plan and its progress.
+Your task is to determine the single next step, ensuring it aligns with the overall goal and builds upon the previous steps.
+The step will be executed by a helper that has the following capabilities: A large language model that has access to tools to search personal documents and search the web.
 
 JSON Structure:
 {
@@ -96,29 +141,78 @@ JSON Structure:
 Guidelines:
 1. If the last step output is ##NO##, reassess and refine the instruction to avoid repeating past mistakes. Provide a single, revised instruction for the next step.
 2. If the last step output is ##YES##, proceed to the next logical step in the plan.
-3. Use 'Last Step', 'Last Output', and 'Steps Taken' for context when deciding on the next action.
+3. Use 'Last Step', 'Last Step Output', and 'Steps Taken' for context when deciding on the next action.
+4. Only instruct the helper to do something that is within their capabilities.
 
 Restrictions:
 1. Do not attempt to resolve the problem independently; only provide instructions for the subsequent agent's actions.
 2. Limit your response to a single step or instruction.
-
-Example of a single instruction:
-- "Analyze the dataset for missing values and report their percentage."
     """
 
 STEP_CRITIC_PROMPT = """The previous instruction was {last_step} \nThe following is the output of that instruction.
-    if the output of the instruction completely satisfies the instruction, then reply with ##YES##.
+    if the output of the instruction completely satisfies the instruction, then reply with True for the decision and an explanation why.
     For example, if the instruction is to list companies that use AI, then the output contains a list of companies that use AI.
     If the output contains the phrase 'I'm sorry but...' then it is likely not fulfilling the instruction. \n
-    If the output of the instruction does not properly satisfy the instruction, then reply with ##NO## and the reason why.
+    If the output of the instruction does not properly satisfy the instruction, then reply with False for the decision and the reason why.
     For example, if the instruction was to list companies that use AI but the output does not contain a list of companies, or states that a list of companies is not available, then the output did not properly satisfy the instruction.
-    If it does not satisfy the instruction, please think about what went wrong with the previous instruction and give me an explanation along with the text ##NO##. \n
+    If it does not satisfy the instruction, please think about what went wrong with the previous instruction and give me an explanation along with a False for the decision. \n
+    Remember to always provide both a decision and an explanation.
     Previous step output: \n {last_output}"""
 
 
+SEARCH_QUERY_GENERATION_PROMPT = """You are a search query generation assistant.
+Your task is to take a long, detailed user request and break it down into multiple focused, high-quality search queries.
+Each query should target a distinct subtopic or key aspect of the original request so that, together, the queries fully cover the user’s information need.
+
+Instructions:
+
+- Identify all major subtopics, steps, or themes in the input.
+- Write clear and specific search queries for each subtopic.
+- Include relevant keywords, entities, or technologies.
+- Use the date to augment queries if the user is asking of recent or latest information but be very precise. (Assume the current date is {datetime.now(UTC).strftime("%B %d, %Y")})
+- Use the + operator to boost important concepts.
+- Do not simply restate the input as one query—decompose it into up to 3 targeted queries.
+Example Input:
+“strategies for launching a new productivity mobile app, including market research on user behavior trends, competitor analysis in the productivity app space, feature prioritization based on user needs, designing intuitive onboarding experiences, implementing in-app analytics for engagement tracking, planning a social media marketing campaign, testing beta versions with early adopters, collecting feedback, and preparing for a global rollout.”
+Expected Output:
+[
+    "effective +strategies for launching new +productivity mobile apps in 2025 --QDF=5",
+    "market research and competitor analysis for +productivity apps",
+    "onboarding design and +in-app analytics strategies for mobile applications"
+]
+"""
+
+REPORT_WRITER_PROMPT = """
+You are a precise and well-structured report writer.
+Your task is to summarize the information provided to you in order to directly answer the user’s instruction or query.
+
+Guidelines:
+
+1. Use **only the information provided**. Do not make up, infer, or fabricate facts.
+2. Organize the report into clear sections with headings when appropriate.
+3. For every statement, fact, or claim that is derived from a specific source, **cite it with an explicit hyperlink** to the original URL. Use Markdown citation format like this:
+
+   * Example: “The system achieved state-of-the-art results [source](https://example.com/article).”
+4. If multiple sources support a point, you may cite more than one.
+5. If some information is repeated across multiple sources, summarize it concisely without redundancy.
+6. If the provided information does not fully answer the user’s query, clearly state what is missing, but do not invent new details.
+7. Maintain a neutral, factual tone — avoid speculation, exaggeration, or opinion.
+
+Output Format:
+
+* Begin with a short **executive summary** that directly answers the query.
+* Follow with supporting details structured in sections and paragraphs.
+* Include hyperlinks inline with each reference.
+
+Important:
+
+* Do not include any sources or information not explicitly provided.
+* Do not use vague references like “according to a website” — always hyperlink.
+* If no sources are relevant, say so explicitly.
+"""
 class Pipe:
     class Valves(BaseModel):
-        TASK_MODEL_ID: str = Field(default="granite3.3:8b")
+        TASK_MODEL_ID: str = Field(default="ibm/granite4:latest")
         VISION_MODEL_ID: str = Field(default="granite3.2-vision:2b")
         OPENAI_API_URL: str = Field(default="http://localhost:11434")
         OPENAI_API_KEY: str = Field(default="ollama")
@@ -205,57 +299,60 @@ class Pipe:
         ##################
         # AutoGen Config
         ##################
-        # LLM Config
-        ollama_llm_config = {
-            "config_list": [
-                {
-                    "model": default_model,
-                    "client_host": base_url,
-                    "api_type": "ollama",
-                    "temperature": model_temp,
-                    "num_ctx": 131072,
-                }
-            ],
-        }
-
+        # Structured Output Objects for each agent
         class Plan(BaseModel):
             steps: list[str]
+        
+        class CriticDecision(BaseModel):
+            decision: bool = Field(description="A true or false decision on whether the goal has been fully accomplished")
+            explanation: str = Field(description="A thorough yet concise explanation of why you came to this decision.")
 
-        planner_llm_config = {
-            "config_list": [
-                {
-                    "model": default_model,
-                    "client_host": base_url,
-                    "api_type": "ollama",
-                    "temperature": model_temp,
-                    "num_ctx": 131072,
-                    "response_format": Plan,
-                }
-            ],
+        class Step(BaseModel):
+            step_instruction: str = Field(description="A concise instruction of what the next step in the plan should be")
+            requirement_to_fulfill: str = Field(description="Explain your thinking around the requirement of the plan that this step will accomplish and why you chose the step instruction")
+        
+        class SearchQueries(BaseModel):
+            search_queries: list[str] = Field(description="A list of search queries")
+
+        # LLM Config
+        base_llm_config = {
+            "model": default_model,
+            "client_host": base_url,
+            "api_type": "ollama",
+            "temperature": model_temp,
+            "num_ctx": 131072,
         }
 
-        vision_llm_config = {
-            "config_list": [
-                {
-                    "model": vision_model,
-                    "base_url": vision_url,
-                    "api_type": "openai",
-                    "api_key": api_key
-                }
-            ],
+        llm_configs = {
+            "ollama_llm_config": {**base_llm_config, "config_list": [{**base_llm_config}]},
+            "planner_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": Plan}]},
+            "critic_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": CriticDecision}]},
+            "reflection_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": Step}]},
+            "search_query_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": SearchQueries}]},
+            "vision_llm_config": {
+                "config_list": [
+                    {
+                        "model": vision_model,
+                        "base_url": vision_url,
+                        "api_type": "openai",
+                        "api_key": api_key
+                    }
+                ]
+            },
         }
 
+        ### Agents
         # Generic LLM completion, used for servicing Open WebUI originated requests
         generic_assistant = ConversableAgent(
             name="Generic_Assistant",
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["ollama_llm_config"],
             human_input_mode="NEVER",
         )
 
         # Vision Assistant
         vision_assistant = ConversableAgent(
             name="Vision_Assistant",
-            llm_config=vision_llm_config,
+            llm_config=llm_configs["vision_llm_config"],
             human_input_mode="NEVER",
         )
 
@@ -263,7 +360,7 @@ class Pipe:
         planner = ConversableAgent(
             name="Planner",
             system_message=PLANNER_MESSAGE,
-            llm_config=planner_llm_config,
+            llm_config=llm_configs["planner_llm_config"],
             human_input_mode="NEVER",
         )
 
@@ -271,7 +368,7 @@ class Pipe:
         assistant = ConversableAgent(
             name="Research_Assistant",
             system_message=ASSISTANT_PROMPT,
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["ollama_llm_config"],
             human_input_mode="NEVER",
             is_termination_msg=lambda msg: "tool_response" not in msg
             and msg["content"] == "",
@@ -281,14 +378,14 @@ class Pipe:
         goal_judge = ConversableAgent(
             name="GoalJudge",
             system_message=GOAL_JUDGE_PROMPT,
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["critic_llm_config"],
             human_input_mode="NEVER",
         )
 
         # Step Critic
         step_critic = ConversableAgent(
             name="Step_Critic",
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["critic_llm_config"],
             human_input_mode="NEVER",
         )
 
@@ -296,22 +393,31 @@ class Pipe:
         reflection_assistant = ConversableAgent(
             name="ReflectionAssistant",
             system_message=REFLECTION_ASSISTANT_PROMPT,
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["reflection_llm_config"],
             human_input_mode="NEVER",
         )
 
         # Report Generator
         report_generator = ConversableAgent(
             name="Report_Generator",
-            llm_config=ollama_llm_config,
+            llm_config=llm_configs["ollama_llm_config"],
             human_input_mode="NEVER",
+            system_message=REPORT_WRITER_PROMPT
+        )
+
+        # Search Query generator
+        search_query_generator = ConversableAgent(
+            name="Search_Query_Generator",
+            system_message=SEARCH_QUERY_GENERATION_PROMPT,
+            llm_config=llm_configs["search_query_llm_config"],
+            human_input_mode="NEVER"
         )
 
         # User Proxy chats with assistant on behalf of user and executes tools
         user_proxy = ConversableAgent(
             name="User",
             human_input_mode="NEVER",
-            is_termination_msg=lambda msg: "##ANSWER##" in msg["content"]
+            is_termination_msg=lambda msg: "##ANSWER" in msg["content"]
             or "## Answer" in msg["content"]
             or "##TERMINATE##" in msg["content"]
             or ("tool_calls" not in msg and msg["content"] == ""),
@@ -329,7 +435,8 @@ class Pipe:
         # Tool Definitions
         ##################
         @assistant.register_for_llm(
-            name="web_search", description="Searches the web according to a given query"
+            name="web_search", description="Use this tool to search the internet for up-to-date, location-specific, or niche information that may not be reliably available in the model’s training data. \
+                This includes current events, fresh statistics, local details, product information, regulations, sports schedules, software updates, company details, and anything that changes frequently over time."
         )
         @user_proxy.register_for_execution(name="web_search")
         def do_web_search(
@@ -340,16 +447,23 @@ class Pipe:
                                                         Construct the instruction to enable a targeted search by specifying important attributes, keywords, and relationships within the context.",
             ]
         ) -> str:
-            """This function is used for searching the web for information that can only be found on the internet, not in the users personal notes."""
+            """This function is used for searching the internet for information that can only be found on the internet, not in the users personal notes."""
             if not search_instruction:
                 return "Please provide a search query."
 
-            result = retrieval.search_web(
-                self.owui_request,
-                self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
-                search_instruction,
-            )
-            return str(result)
+            response = user_proxy.initiate_chat(recipient=search_query_generator, max_turns=1, message=search_instruction)
+            search_queries = json.loads(response.chat_history[-1]["content"])["search_queries"]
+            search_results = []
+            for query in search_queries:
+                logging.info("Searching for " + query)
+                results = retrieval.search_web(
+                    self.owui_request,
+                    self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
+                    search_instruction,
+                )
+                for result in results:
+                    search_results.append({"Title": result.title, "URL": result.link, "Text": result.snippet})
+            return str(search_results)
 
         @assistant.register_for_llm(
             name="personal_knowledge_search",
@@ -430,14 +544,14 @@ class Pipe:
                 f"Accompanying image description: {image_description}"
             )
 
-        # Instructions going forward are a conglameration of user input text and image description
+        # Instructions going forward are a conglomeration of user input text and image description
         plan_instruction = latest_content + "\n\n" + "\n".join(image_descriptions)
 
         # Create the plan, using structured outputs
         await self.emit_event_safe(message="Creating a plan...")
         try:
             planner_output = await user_proxy.a_initiate_chat(
-                message=plan_instruction, max_turns=1, recipient=planner
+                message=f"Gather enough data to accomplish the goal: {plan_instruction}", max_turns=1, recipient=planner
             )
             planner_output = planner_output.chat_history[-1]["content"]
             plan_dict = json.loads(planner_output)
@@ -458,7 +572,6 @@ class Pipe:
             else:
                 # Previous steps in the plan have already been executed.
                 await self.emit_event_safe(message="Planning the next step...")
-                reflection_message = last_step
                 # Ask the critic if the previous step was properly accomplished
                 output = await user_proxy.a_initiate_chat(
                     recipient=step_critic,
@@ -470,20 +583,22 @@ class Pipe:
                     ),
                 )
                 
-                was_job_accomplished = output.chat_history[-1]["content"]
+                was_job_accomplished = json.loads(output.chat_history[-1]["content"])
                 # If it was not accomplished, make sure an explanation is provided for the reflection assistant
-                if "##NO##" in was_job_accomplished:
-                    reflection_message = f"The previous step was {last_step} but it was not accomplished satisfactorily due to the following reason: \n {was_job_accomplished}."
+                if not was_job_accomplished["decision"]:
+                    reflection_message = f"The previous step was {last_step} but it was not accomplished satisfactorily due to the following reason: \n {was_job_accomplished['explanation']}."
                 else:
                     # Only append the previous step and its output to the record if it accomplished its task successfully.
-                    # It was found that storing information about unsuccesful steps causes more confusion than help to the agents
+                    # It was found that storing information about unsuccessful steps causes more confusion than help to the agents
                     answer_output.append(last_output)
                     steps_taken.append(last_step)
+                    reflection_message = f"The previous step was successfully completed: {last_step}"
 
                 goal_message = {
-                    "Goal": latest_content,
+                    "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
                     "Media Description": image_descriptions,
-                    "Plan": plan_dict,
+                    "Originally Planned Steps: ": str(plan_dict),
+                    "Steps Taken so far": str(steps_taken),
                     "Information Gathered": answer_output,
                 }
 
@@ -492,17 +607,18 @@ class Pipe:
                     max_turns=1,
                     message=f"(```{str(goal_message)}```",
                 )
-                was_goal_accomplished = output.chat_history[-1]["content"]
-                if not "##NOT YET##" in was_goal_accomplished:
+                was_goal_accomplished = json.loads(output.chat_history[-1]["content"])
+                if was_goal_accomplished["decision"]:
+                    # We've accomplished the goal, exit loop.
                     break
 
                 # Then, ask the reflection agent for the next step
                 message = {
-                    "Goal": latest_content,
+                    "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
                     "Media Description": image_descriptions,
                     "Plan": str(plan_dict),
                     "Last Step": reflection_message,
-                    "Last Step Output": str(last_output),
+                    "Last Step Output": str(last_output["answer"]),
                     "Steps Taken": str(steps_taken),
                 }
                 output = await user_proxy.a_initiate_chat(
@@ -510,34 +626,34 @@ class Pipe:
                     max_turns=1,
                     message=f"(```{str(message)}```",
                 )
-                instruction = output.chat_history[-1]["content"]
-
-                if "##TERMINATE##" in instruction:
-                    # A termination message means there are no more steps to take. Exit the loop.
-                    break
+                instruction_dict = json.loads(output.chat_history[-1]["content"])
+                instruction = instruction_dict['step_instruction']
 
             # Now that we have determined the next step to take, execute it
             await self.emit_event_safe(message="Executing step: " + instruction)
-            prompt = instruction
+            prompt = f"Instruction: {instruction}"
             if answer_output:
                 prompt += f"\n Contextual Information: \n{answer_output}"
             output = await user_proxy.a_initiate_chat(
-                recipient=assistant, max_turns=3, message=prompt
+                recipient=assistant, message=prompt
             )
 
             # Sort through the chat history and extract out replies from the assistant (We don't need the full results of the tool calls, just the assistant's summary)
-            previous_output = []
+            assistant_replies = []
+            raw_tool_output = []
             for chat_item in output.chat_history:
+                if chat_item["role"] == "tool":
+                    raw_tool_output.append(chat_item["content"])
                 if chat_item["content"] and chat_item["name"] == "Research_Assistant":
-                    previous_output.append(chat_item["content"])
+                    assistant_replies.append(chat_item["content"])
+            last_output = {"answer": assistant_replies, "sources": raw_tool_output}
 
             # The previous instruction and its output will be recorded for the next iteration to inspect before determining the next step of the plan
-            last_output = previous_output
             last_step = instruction
 
         await self.emit_event_safe(message="Summing up findings...")
         # Now that we've gathered all the information we need, we will summarize it to directly answer the original prompt
-        final_prompt = f"Answer the user's query: {plan_instruction}. Use the following information only. Do NOT supplement with your own knowledge: {answer_output}"
+        final_prompt = f"User's query: {plan_instruction}. Information Gathered: {answer_output}"
         final_output = await user_proxy.a_initiate_chat(
             message=final_prompt, max_turns=1, recipient=report_generator
         )

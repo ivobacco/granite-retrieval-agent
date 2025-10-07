@@ -1,9 +1,10 @@
 """
-requirements: crewai==0.117.0, crewai-tools==0.33.0, ollama
+requirements: crewai==0.201.1, crewai-tools==0.75.0, ollama
 """
 import anyio
 import asyncio
 import logging
+import os
 from typing import Optional, Callable, Awaitable, List
 
 from crewai import Crew, Process, Agent, Task, LLM
@@ -16,6 +17,7 @@ from open_webui.models.knowledge import KnowledgeTable
 from open_webui import config as open_webui_config
 from pydantic import BaseModel, Field
 
+os.environ["CREWAI_DISABLE_TELEMETRY"] = "true"
 
 ####################
 # Prompts
@@ -46,28 +48,45 @@ Be sure to describe ALL prominent aspects of this image; do not miss any.
 ITEM_IDENTIFIER_PROMPT = """
     You are an item identifier.You will be given a description of an image, and your job is to identify all items and concepts that are part of the 
     image that will need to be researched in order to accomplish the goal.
-    You will limit the number of items to the {item_limit} most important items pertaining to the image that will accopmlish the goal.
+    You will limit the number of items to the {item_limit} most important items pertaining to the image that will accomplish the goal.
     You will not perform the research yourself, but will work with a helper who will perform the research. The helper has the following capabilities:
-    1. Genearl generative AI capabilities.
+    1. General generative AI capabilities.
     2. Search the internet
     3. Search the user's document store
     When giving out research tasks, please constrain the instructions to be within what the helper is capable of, and nothing beyond."""
 
 ASSISTANT_PROMPT = """
-    Make sure to provide a thorough answer that directly addresses the message you received.
-    If the task is able to be accomplished without using tools, then do not make any tool calls.
-    
-    # Tool Use
-    You have access to the following tools. Only use these available tools and do not attempt to use anything not listed - this will cause an error.
-    When suggesting tool calls, please respond with a JSON for a function call with its proper arguments. Use non-escaped double quotes in the JSON.
-    When you are using knowledge and web search tools to complete the instruction, answer the instruction only using the results from the search; do no supplement with your own knowledge.
-    Never answer the instruction using links to URLs that were not discovered during the use of your search tools. Only respond with document links and URLs that your tools returned to you.
-    Also make sure to provide the URL for the page you are using as your source or the document name.
+You are a research assistant that will use tools to find information on a given topic.
+- Make sure to provide a thorough answer that directly addresses the message you received.
+- You have access to the following tools. Only use these available tools and do not attempt to use anything not listed - this will cause an error.
+- When you are using knowledge and web search tools to complete the instruction, answer the instruction only using the results from the search; do no supplement with your own knowledge.
+- Never answer the instruction using links to URLs that were not discovered during the use of your search tools. Only respond with document links and URLs that your tools returned to you.
+- Make sure to provide the URL for the page you are using as your source or the document name.
+- If a tool error occurs in Observation (e.g., unknown action, invalid input), correct the mistake and try again.
+- Use at most one tool per step. You may perform multiple steps if needed.
     """
+
+SEARCH_QUERY_GENERATION_PROMPT = """You are a search query generation assistant.
+Your task is to take a long, detailed user request and produce a single, optimized search query that fully captures the user’s information need.
+
+Instructions:
+
+* Identify the main topic and the most important subtopics or keywords.
+* Write one clear, specific, and comprehensive search query that covers all key aspects.
+* Include relevant keywords, entities, or technologies.
+* Use the + operator to boost important concepts.
+* Do not produce multiple queries or lists; return exactly one optimized query.
+
+Example Input:
+“strategies for launching a new productivity mobile app, including research, competitor analysis, onboarding, analytics, marketing, testing, and rollout.”
+
+Expected Output:
+"+strategies for launching +productivity mobile apps 2025 marketing onboarding analytics --QDF=5"
+  """
 
 class Pipe:
     class Valves(BaseModel):
-        TASK_MODEL_ID: str = Field(default="ollama/granite3.2:8b-instruct-q8_0")
+        TASK_MODEL_ID: str = Field(default="ollama/ibm/granite4:tiny-h")
         VISION_MODEL_ID: str = Field(
             default="ollama/granite3.2-vision:2b"
         )
@@ -76,7 +95,7 @@ class Pipe:
         VISION_API_URL: str = Field(default=open_webui_config.OLLAMA_BASE_URL or "http://localhost:11434")
         MODEL_TEMPERATURE: float = Field(default=0)
         MAX_RESEARCH_CATEGORIES: int = Field(default=4)
-        MAX_RESEARCH_ITERATIONS: int = Field(default=6)
+        MAX_RESEARCH_ITERATIONS: int = Field(default=3)
         INCLUDE_KNOWLEDGE_SEARCH: bool = Field(default=False)
         RUN_PARALLEL_TASKS: bool = Field(default=False)
 
@@ -99,6 +118,7 @@ class Pipe:
         message = str(body[-1])
 
         prompt_templates = {
+            "### Task",
             open_webui_config.DEFAULT_RAG_TEMPLATE.replace("\n", "\\n"),
             open_webui_config.DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE.replace(
                 "\n", "\\n"
@@ -136,14 +156,22 @@ class Pipe:
         except Exception as e:
             logging.error(f"Error emitting event: {e}")
     
+    @staticmethod
+    def _safe_schedule(coro: asyncio.coroutines):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro)  # we're already in an event loop
+        except RuntimeError:
+            # no running loop (sync context), so create one just for this
+            asyncio.run(coro)
+
     def log_task_completion(self, output: TaskOutput):
-        asyncio.run(self.emit_event_safe(f"Completed Task: {output.summary}"))
+        self._safe_schedule(self.emit_event_safe(f"Completed Task: {output.summary}"))
 
     def log_research_items(self, output: TaskOutput):
-        items = []
-        for i in output.pydantic.items:
-            items.append(i.item_name)
-        asyncio.run(self.emit_event_safe(f"Research Items Identified: {items}"))
+        items = [i.item_name for i in output.pydantic.items]
+        self._safe_schedule(self.emit_event_safe(f"Research Items Identified: {items}"))
+
 
     async def pipe(
         self,
@@ -190,25 +218,46 @@ class Pipe:
         ##################
         if self.is_open_webui_request(body["messages"]):
             print("Is open webui request")
-            reply = llm.call([body["messages"][-1]])
+            reply = await anyio.to_thread.run_sync(lambda: llm.call([body["messages"][-1]]))
             return reply
 
         ##################
         # Tool Definitions
         ##################
-
         @tool("WebSearch")
-        def do_web_search(search_instructions: str) -> str:
-            """Use this to search the internet. To use, provide a detailed search instruction that incorporates specific features, goals, and contextual details related to the query.
-            Identify and include relevant aspects from any provided context, such as key topics, technologies, challenges, timelines, or use cases.
-            Construct the instruction to enable a targeted search by specifying important attributes, keywords, and relationships within the context.
+        def do_web_search(query: str) -> str:
+            """Use this to search the internet. 
+
+            Provide a **search engine–optimized query string** as the parameter. 
+            Your goal is to generate a single, well-structured query that could be directly entered into a search engine (e.g., Google, Bing) to retrieve the most relevant results. 
+
+            ✅ **How to construct the query**:
+            - Identify the **core topic** or entity (e.g., product, technology, event, person, regulation).
+            - Add **specific attributes, goals, or context** (e.g., “best practices”, “latest update”, “integration guide”, “release date”).
+            - Include **relevant keywords and modifiers** to narrow the scope (e.g., location, time frame, use case, version).
+            - Use **natural phrasing** or **keyword-style phrasing** depending on what would perform best in search engines. 
+            Examples:
+                - Natural language: “What are the latest tax filing deadlines for small businesses in California 2025”
+                - Keyword style: “California 2025 small business tax filing deadlines”
+
+            📝 **Examples**:
+            - “EU AI Act regulatory timeline 2025 summary”
+            - “integration guide Stripe API Python 2025”
+            - “best laptop for machine learning reviews October 2025”
+
+            The returned string should be the **final optimized query**, not an explanation.
             """
-            result = retrieval.search_web(
-                self.owui_request,
-                self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
-                search_instructions,
+            search_results = []
+
+            results = retrieval.search_web(
+                request=self.owui_request,
+                engine=self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
+                query=query,
             )
-            return str(result)
+            for result in results:
+                search_results.append({"Title": result.title, "URL": result.link, "Text": result.snippet})
+ 
+            return str(search_results)
 
         @tool("Knowledge Search")
         def do_knowledge_search(search_instruction: str) -> str:
@@ -252,10 +301,11 @@ class Pipe:
             goal="Identify which concepts that are in a described image need to be researched in order to accomplish the goal.",
             backstory=ITEM_IDENTIFIER_PROMPT,
             llm=llm,
+            use_system_prompt=False,
             verbose=True,
         )
         identification_task = Task(
-            description="Thorougly identify all items and concepts that are part of the image that will need to be researched in order to accomplish the goal. Goal: {goal} \n Image Description: {image_description}",
+            description="Thoroughly identify all items and concepts that are part of the image that will need to be researched in order to accomplish the goal. Goal: {goal} \n Image Description: {image_description}",
             agent=item_identifier,
             expected_output="A list of items and concepts that need to be researched in order to accomplish the goal.",
             output_pydantic=ResearchItems,
@@ -278,11 +328,12 @@ class Pipe:
             goal="You will be given a step/instruction to accomplish. Fully answer the instruction/question using document search or web search tools as necessary.",
             backstory=ASSISTANT_PROMPT,
             llm=llm,
+            use_system_prompt=False,
             verbose=True,
             max_iter=max_research_iters,
             tools=available_tools,
         )
-        resarch_task = Task(
+        research_task = Task(
             description="Fulfill the instruction given. {item_name} {research_instructions}",  # Keep in mind the previously gathered data from previous steps: {previously_executed_steps}',
             agent=researcher,
             expected_output="Information that directly answers the instruction given. If your answer references websites or documents, provide in-line citations in the form of hyperlinks for every reference.",
@@ -290,7 +341,7 @@ class Pipe:
         )
         research_crew = Crew(
             agents=[researcher],
-            tasks=[resarch_task],
+            tasks=[research_task],
             share_crew=False,
             verbose=True,
         )
@@ -357,32 +408,34 @@ class Pipe:
                 base64_image = base64_image[index_of_comma + 1:]
             image_urls.append(base64_image)
 
-        messages = [
-            {
-                "role": "user",
-                "content": image_query,
-                "images": image_urls
-            }
-        ]
+        image_descriptions = ""
+        if image_urls:
+            messages = [
+                {
+                    "role": "user",
+                    "content": image_query,
+                    "images": image_urls
+                }
+            ]
 
-        # Here we are going to use the ollama client directly to describe the image
-        # For some reason, the LiteLLM client inside CrewAI was not properly forwarding the image over to Ollama
-        # Contributions welcome if you can fix this and make it backend provider agnostic :-)
-        index_of_slash = vision_model.find("/")
-        ollama_vision_model = vision_model
-        if index_of_slash >=0:
-            ollama_vision_model = vision_model[index_of_slash + 1:]
-        ollama_client = OllamaClient(
-            host=vision_url,
-        )
-        ollama_output = await ollama_client.chat(
-            model=ollama_vision_model,
-            messages = messages,
-        )
-        image_descriptions = ollama_output['message']['content']
+            # Here we are going to use the ollama client directly to describe the image
+            # For some reason, the LiteLLM client inside CrewAI was not properly forwarding the image over to Ollama
+            # Contributions welcome if you can fix this and make it backend provider agnostic :-)
+            index_of_slash = vision_model.find("/")
+            ollama_vision_model = vision_model
+            if index_of_slash >=0:
+                ollama_vision_model = vision_model[index_of_slash + 1:]
+            ollama_client = OllamaClient(
+                host=vision_url,
+            )
+            ollama_output = await ollama_client.chat(
+                model=ollama_vision_model,
+                messages = messages,
+            )
+            image_descriptions = ollama_output['message']['content']
 
         # Start identifying research goals according to the image description
-        await self.emit_event_safe("Creating a resesarch plan...")
+        await self.emit_event_safe("Creating a research plan...")
         identifier_goal = DEFAULT_ITEM_IDENTIFIER_GOAL
         if latest_instruction:
             identifier_goal += f"\n\nUse the following instruction from the user to further guide you: {latest_instruction}"
@@ -402,14 +455,17 @@ class Pipe:
                 }
             )
         
+        outputs = []
         try:
             if run_parallel_tasks:
                 outputs = await research_crew.kickoff_for_each_async(tasks)
             else:
-                outputs = await anyio.to_thread.run_sync(lambda: research_crew.kickoff_for_each(tasks))
+                for task in tasks:
+                    outputs.append(await research_crew.kickoff_async(task))
         except Exception as e:
             logging.error(f"Error in research crew: {e}")
-            outputs = resarch_task.output.raw
+            outputs = research_task.output.raw
+
 
         # Create the final report
         await self.emit_event_safe("Summing up findings...")
@@ -417,5 +473,4 @@ class Pipe:
         If no reference URLs exist, do not fabricate them. If the following information does not have all the information you need to answer all aspects of the user question, then you may highlight those aspects. 
         User query: {DEFAULT_INSTRUCTION} \n\n Image description:  {image_descriptions} \n\n Gathered information: {outputs}"""
         final_output =  await anyio.to_thread.run_sync(lambda: llm.call(prompt))
-        await self.emit_event_safe("(If results don't show soon, refresh)")
         return final_output
