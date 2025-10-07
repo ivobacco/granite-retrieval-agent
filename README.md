@@ -74,9 +74,24 @@ The **Image Research Agent** analyzes images and performs multi-agent research o
 
 # 🛠 Getting Started
 
-## **1. Install Ollama**
+## **1. Setup Ollama**
 
 Go to [ollama.com](https://ollama.com/) and hit Download!
+
+Once installed, pull the Granite 4 Micro model for the Granite Retrieval Agent
+```
+ollama pull ibm/granite4:latest
+```
+
+Pull the Granite 4 Tiny model for the Image Researcher
+```
+ollama pull ibm/granite4:tiny-h
+```
+
+If you would like to use the vision capabilities in these agents, pull the Granite Vision model
+```
+ollama pull granite3.2-vision:2b
+```
 
 ## **2. Install Open WebUI**
 
