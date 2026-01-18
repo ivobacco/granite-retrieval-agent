@@ -1,5 +1,15 @@
 """
 requirements:  ag2==0.9.10, ag2[ollama]==0.9.10, ag2[openai]==0.9.10
+
+This pipe supports two LLM provider modes:
+1. Ollama (Local): Set USE_OPENROUTER=False (default)
+   - Requires local Ollama instance running on http://localhost:11434
+   - Uses IBM Granite models by default
+
+2. OpenRouter (Cloud): Set USE_OPENROUTER=True
+   - Requires OPENROUTER_API_KEY (get from https://openrouter.ai/)
+   - Access to 300+ models from OpenAI, Anthropic, Google, Meta, Mistral, etc.
+   - Default model: anthropic/claude-3.5-sonnet
 """
 
 from fastapi import Request
@@ -40,7 +50,7 @@ Plan: [
 
 Example 3:
 User Input: Gather current statistics on electric vehicle adoption rates in Europe and government incentive programs.
-[
+Plan: [
 "Search the internet for recent statistics on electric vehicle adoption rates in Europe",
 "Search the internet for information about government incentive programs for electric vehicles in European countries"
 ]
@@ -212,11 +222,23 @@ Important:
 """
 class Pipe:
     class Valves(BaseModel):
-        TASK_MODEL_ID: str = Field(default="ibm/granite4:latest")
-        VISION_MODEL_ID: str = Field(default="granite3.2-vision:2b")
-        OPENAI_API_URL: str = Field(default="http://localhost:11434")
-        OPENAI_API_KEY: str = Field(default="ollama")
-        VISION_API_URL: str = Field(default="http://localhost:11434/v1")
+        # Provider Selection
+        USE_OPENROUTER: bool = Field(default=True, description="Use OpenRouter API instead of local Ollama")
+
+        # OpenRouter Configuration (Cloud)
+        OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API key (sk-or-v1-...)")
+        OPENROUTER_BASE_URL: str = Field(default="https://openrouter.ai/api/v1", description="OpenRouter API base URL")
+        OPENROUTER_TASK_MODEL: str = Field(default="xiaomi/mimo-v2-flash:free", description="OpenRouter model for tasks")
+        OPENROUTER_VISION_MODEL: str = Field(default="xiaomi/mimo-v2-flash:free", description="OpenRouter model for vision tasks")
+
+        # Local Ollama Configuration (Local)
+        TASK_MODEL_ID: str = Field(default="xiaomi/mimo-v2-flash:free")
+        VISION_MODEL_ID: str = Field(default="xiaomi/mimo-v2-flash:free")
+        OPENAI_API_URL: str = Field(default="https://openrouter.ai/api/v1")
+        OPENAI_API_KEY: str = OPENROUTER_API_KEY
+        VISION_API_URL: str = Field(default="https://openrouter.ai/api/v1")
+
+        # Common Configuration
         MODEL_TEMPERATURE: float = Field(default=0)
         MAX_PLAN_STEPS: int = Field(default=6)
 
@@ -228,7 +250,7 @@ class Pipe:
 
     def get_provider_models(self):
         return [
-            {"id": self.valves.TASK_MODEL_ID, "name": self.valves.TASK_MODEL_ID},
+            {"id": self.valves.OPENROUTER_TASK_MODEL, "name": self.valves.TASK_MODEL_ID},
         ]
 
     def is_open_webui_request(self, body):
@@ -302,7 +324,7 @@ class Pipe:
         # Structured Output Objects for each agent
         class Plan(BaseModel):
             steps: list[str]
-        
+
         class CriticDecision(BaseModel):
             decision: bool = Field(description="A true or false decision on whether the goal has been fully accomplished")
             explanation: str = Field(description="A thorough yet concise explanation of why you came to this decision.")
@@ -310,34 +332,65 @@ class Pipe:
         class Step(BaseModel):
             step_instruction: str = Field(description="A concise instruction of what the next step in the plan should be")
             requirement_to_fulfill: str = Field(description="Explain your thinking around the requirement of the plan that this step will accomplish and why you chose the step instruction")
-        
+
         class SearchQueries(BaseModel):
             search_queries: list[str] = Field(description="A list of search queries")
 
-        # LLM Config
-        base_llm_config = {
-            "model": default_model,
-            "client_host": base_url,
-            "api_type": "ollama",
-            "temperature": model_temp,
-            "num_ctx": 131072,
-        }
+        # LLM Config - Support both Ollama (local) and OpenRouter (cloud)
+        use_openrouter = self.valves.USE_OPENROUTER
+
+        if use_openrouter:
+            # OpenRouter Configuration
+            if not self.valves.OPENROUTER_API_KEY:
+                raise ValueError("OPENROUTER_API_KEY must be set when USE_OPENROUTER is enabled")
+
+            base_llm_config = {
+                "model": self.valves.OPENROUTER_TASK_MODEL,
+                "base_url": self.valves.OPENROUTER_BASE_URL,
+                "api_type": "openai",
+                "api_key": self.valves.OPENROUTER_API_KEY,
+                "temperature": model_temp,
+            }
+
+            quick_llm_config = {
+                "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+                "base_url": self.valves.OPENROUTER_BASE_URL,
+                "api_type": "openai",
+                "api_key": self.valves.OPENROUTER_API_KEY,
+                "temperature": model_temp,
+            }
+
+            vision_config = {
+                "model": self.valves.OPENROUTER_VISION_MODEL,
+                "base_url": self.valves.OPENROUTER_BASE_URL,
+                "api_type": "openai",
+                "api_key": self.valves.OPENROUTER_API_KEY,
+            }
+        else:
+            # Ollama Configuration (Local)
+            base_llm_config = {
+                "model": default_model,
+                "client_host": base_url,
+                "api_type": "openai",
+                "temperature": model_temp,
+                "num_ctx": 131072,
+            }
+
+            vision_config = {
+                "model": vision_model,
+                "base_url": vision_url,
+                "api_type": "openai",
+                "api_key": api_key,
+            }
 
         llm_configs = {
             "ollama_llm_config": {**base_llm_config, "config_list": [{**base_llm_config}]},
-            "planner_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": Plan}]},
+            "planner_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": Plan}]},
             "critic_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": CriticDecision}]},
             "reflection_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": Step}]},
-            "search_query_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": SearchQueries}]},
+            "search_query_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": SearchQueries}]},
             "vision_llm_config": {
-                "config_list": [
-                    {
-                        "model": vision_model,
-                        "base_url": vision_url,
-                        "api_type": "openai",
-                        "api_key": api_key
-                    }
-                ]
+                "config_list": [vision_config]
             },
         }
 
@@ -428,8 +481,12 @@ class Pipe:
         ##################
         if self.is_open_webui_request(body["messages"]):
             print("Is open webui request")
-            reply = generic_assistant.generate_reply(messages=[body["messages"][-1]])
-            return reply
+            try:
+                reply = generic_assistant.generate_reply(messages=[body["messages"][-1]])
+                return reply
+            except Exception as e:
+                logging.error(f"Error generating reply from generic assistant: {e}")
+                return f"Error processing request: {str(e)}"
 
         ##################
         # Tool Definitions
@@ -451,18 +508,34 @@ class Pipe:
             if not search_instruction:
                 return "Please provide a search query."
 
-            response = user_proxy.initiate_chat(recipient=search_query_generator, max_turns=1, message=search_instruction)
-            search_queries = json.loads(response.chat_history[-1]["content"])["search_queries"]
+            try:
+                response = user_proxy.initiate_chat(recipient=search_query_generator, max_turns=1, message=search_instruction)
+                search_queries = json.loads(response.chat_history[-1]["content"])["search_queries"]
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse search query response: {e}")
+                return f"Error generating search queries: {str(e)}"
+            except (KeyError, IndexError) as e:
+                logging.error(f"Invalid response structure from search query generator: {e}")
+                return f"Error processing search query response: {str(e)}"
+            except Exception as e:
+                logging.error(f"Error initiating search query generation: {e}")
+                return f"Error during search query generation: {str(e)}"
+
             search_results = []
             for query in search_queries:
                 logging.info("Searching for " + query)
-                results = retrieval.search_web(
-                    self.owui_request,
-                    self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
-                    search_instruction,
-                )
-                for result in results:
-                    search_results.append({"Title": result.title, "URL": result.link, "Text": result.snippet})
+                try:
+                    results = retrieval.search_web(
+                        self.owui_request,
+                        self.owui_request.app.state.config.WEB_SEARCH_ENGINE,
+                        search_instruction,
+                    )
+                    for result in results:
+                        search_results.append({"Title": result.title, "URL": result.link, "Text": result.snippet})
+                except Exception as e:
+                    logging.error(f"Error searching web for query '{query}': {e}")
+                    search_results.append({"Title": "Search Error", "URL": "", "Text": f"Failed to search for: {query}. Error: {str(e)}"})
+
             return str(search_results)
 
         @assistant.register_for_llm(
@@ -481,27 +554,31 @@ class Pipe:
             if not search_instruction:
                 return "Please provide a search query."
 
-            # First get all the user's knowledge bases associated with the model
-            knowledge_item_list = KnowledgeTable().get_knowledge_bases()
-            if len(knowledge_item_list) == 0:
-                return "You don't have any knowledge bases."
-            collection_list = []
-            for item in knowledge_item_list:
-                collection_list.append(item.id)
+            try:
+                # First get all the user's knowledge bases associated with the model
+                knowledge_item_list = KnowledgeTable().get_knowledge_bases()
+                if len(knowledge_item_list) == 0:
+                    return "You don't have any knowledge bases."
+                collection_list = []
+                for item in knowledge_item_list:
+                    collection_list.append(item.id)
 
-            collection_form = retrieval.QueryCollectionsForm(
-                collection_names=collection_list, query=search_instruction
-            )
+                collection_form = retrieval.QueryCollectionsForm(
+                    collection_names=collection_list, query=search_instruction
+                )
 
-            response = retrieval.query_collection_handler(
-                request=self.owui_request, form_data=collection_form, user=self.user
-            )
-            messages = ""
-            for entries in response["documents"]:
-                for line in entries:
-                    messages += line
+                response = retrieval.query_collection_handler(
+                    request=self.owui_request, form_data=collection_form, user=self.user
+                )
+                messages = ""
+                for entries in response.get("documents", []):
+                    for line in entries:
+                        messages += line
 
-            return messages
+                return messages if messages else "No relevant documents found."
+            except Exception as e:
+                logging.error(f"Error searching knowledge base: {e}")
+                return f"Error searching knowledge base: {str(e)}"
 
         #########################
         # Begin Agentic Workflow
@@ -509,6 +586,7 @@ class Pipe:
         # Make a plan
 
         # Grab last message from user
+        last_step = ""
         latest_content = ""
         image_info = []
         content = body["messages"][-1]["content"]
@@ -539,10 +617,16 @@ class Pipe:
                     ],
                 }
             ]
-            image_description = await vision_assistant.a_generate_reply(messages=messages)
-            image_descriptions.append(
-                f"Accompanying image description: {image_description}"
-            )
+            try:
+                image_description = await vision_assistant.a_generate_reply(messages=messages)
+                image_descriptions.append(
+                    f"Accompanying image description: {image_description}"
+                )
+            except Exception as e:
+                logging.error(f"Error analyzing image {i+1}: {e}")
+                image_descriptions.append(
+                    f"Accompanying image description: [Image analysis failed: {str(e)}]"
+                )
 
         # Instructions going forward are a conglomeration of user input text and image description
         plan_instruction = latest_content + "\n\n" + "\n".join(image_descriptions)
@@ -566,96 +650,149 @@ class Pipe:
         last_output = ""  # Output of the single previous step gets put here
 
         for i in range(max_plan_steps):
-            if i == 0:
-                # This is the first step of the plan since there's no previous output
-                instruction = plan_dict["steps"][0]
-            else:
-                # Previous steps in the plan have already been executed.
-                await self.emit_event_safe(message="Planning the next step...")
-                # Ask the critic if the previous step was properly accomplished
-                output = await user_proxy.a_initiate_chat(
-                    recipient=step_critic,
-                    max_turns=1,
-                    message=STEP_CRITIC_PROMPT.format(
-                        last_step=last_step,
-                        context=answer_output,
-                        last_output=last_output,
-                    ),
-                )
-                
-                was_job_accomplished = json.loads(output.chat_history[-1]["content"])
-                # If it was not accomplished, make sure an explanation is provided for the reflection assistant
-                if not was_job_accomplished["decision"]:
-                    reflection_message = f"The previous step was {last_step} but it was not accomplished satisfactorily due to the following reason: \n {was_job_accomplished['explanation']}."
+            try:
+                if i == 0:
+                    # This is the first step of the plan since there's no previous output
+                    instruction = plan_dict["steps"][0]
                 else:
-                    # Only append the previous step and its output to the record if it accomplished its task successfully.
-                    # It was found that storing information about unsuccessful steps causes more confusion than help to the agents
-                    answer_output.append(last_output)
-                    steps_taken.append(last_step)
-                    reflection_message = f"The previous step was successfully completed: {last_step}"
+                    # Previous steps in the plan have already been executed.
+                    await self.emit_event_safe(message="Planning the next step...")
 
-                goal_message = {
-                    "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
-                    "Media Description": image_descriptions,
-                    "Originally Planned Steps: ": str(plan_dict),
-                    "Steps Taken so far": str(steps_taken),
-                    "Information Gathered": answer_output,
-                }
+                    # Ask the critic if the previous step was properly accomplished
+                    try:
+                        output = await user_proxy.a_initiate_chat(
+                            recipient=step_critic,
+                            max_turns=1,
+                            message=STEP_CRITIC_PROMPT.format(
+                                last_step=last_step,
+                                context=answer_output,
+                                last_output=last_output,
+                            ),
+                        )
+                        was_job_accomplished = json.loads(output.chat_history[-1]["content"])
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Failed to parse step critic response: {e}")
+                        # Assume step was accomplished if we can't parse the response
+                        was_job_accomplished = {"decision": True, "explanation": "Unable to parse critic response"}
+                    except Exception as e:
+                        logging.error(f"Error during step critic evaluation: {e}")
+                        was_job_accomplished = {"decision": True, "explanation": f"Critic evaluation error: {str(e)}"}
 
-                output = await user_proxy.a_initiate_chat(
-                    recipient=goal_judge,
-                    max_turns=1,
-                    message=f"(```{str(goal_message)}```",
-                )
-                was_goal_accomplished = json.loads(output.chat_history[-1]["content"])
-                if was_goal_accomplished["decision"]:
-                    # We've accomplished the goal, exit loop.
-                    break
+                    # If it was not accomplished, make sure an explanation is provided for the reflection assistant
+                    if not was_job_accomplished.get("decision") == "True":
+                        reflection_message = f"The previous step was {last_step} but it was not accomplished satisfactorily due to the following reason: \n {was_job_accomplished.get('explanation', 'Unknown reason')}."
+                    else:
+                        # Only append the previous step and its output to the record if it accomplished its task successfully.
+                        # It was found that storing information about unsuccessful steps causes more confusion than help to the agents
+                        answer_output.append(last_output)
+                        steps_taken.append(last_step)
+                        reflection_message = f"The previous step was successfully completed: {last_step}"
 
-                # Then, ask the reflection agent for the next step
-                message = {
-                    "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
-                    "Media Description": image_descriptions,
-                    "Plan": str(plan_dict),
-                    "Last Step": reflection_message,
-                    "Last Step Output": str(last_output["answer"]),
-                    "Steps Taken": str(steps_taken),
-                }
-                output = await user_proxy.a_initiate_chat(
-                    recipient=reflection_assistant,
-                    max_turns=1,
-                    message=f"(```{str(message)}```",
-                )
-                instruction_dict = json.loads(output.chat_history[-1]["content"])
-                instruction = instruction_dict['step_instruction']
+                    goal_message = {
+                        "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
+                        "Media Description": image_descriptions,
+                        "Originally Planned Steps: ": str(plan_dict),
+                        "Steps Taken so far": str(steps_taken),
+                        "Information Gathered": answer_output,
+                    }
 
-            # Now that we have determined the next step to take, execute it
-            await self.emit_event_safe(message="Executing step: " + instruction)
-            prompt = f"Instruction: {instruction}"
-            if answer_output:
-                prompt += f"\n Contextual Information: \n{answer_output}"
-            output = await user_proxy.a_initiate_chat(
-                recipient=assistant, message=prompt
-            )
+                    try:
+                        output = await user_proxy.a_initiate_chat(
+                            recipient=goal_judge,
+                            max_turns=1,
+                            message=f"(```{str(goal_message)}```",
+                        )
+                        was_goal_accomplished = json.loads(output.chat_history[-1]["content"])
+                        if was_goal_accomplished.get("decision") == "True":
+                            # We've accomplished the goal, exit loop.
+                            break
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Failed to parse goal judge response: {e}")
+                        # Continue with the next step if we can't determine goal status
+                    except Exception as e:
+                        logging.error(f"Error during goal judge evaluation: {e}")
+                        # Continue with the next step if evaluation fails
 
-            # Sort through the chat history and extract out replies from the assistant (We don't need the full results of the tool calls, just the assistant's summary)
-            assistant_replies = []
-            raw_tool_output = []
-            for chat_item in output.chat_history:
-                if chat_item["role"] == "tool":
-                    raw_tool_output.append(chat_item["content"])
-                if chat_item["content"] and chat_item["name"] == "Research_Assistant":
-                    assistant_replies.append(chat_item["content"])
-            last_output = {"answer": assistant_replies, "sources": raw_tool_output}
+                    # Then, ask the reflection agent for the next step
+                    # Safely access last_output which could be a string or dict
+                    #last_output_answer = last_output.get("answer", last_output) if isinstance(last_output, dict) else str(last_output)
 
-            # The previous instruction and its output will be recorded for the next iteration to inspect before determining the next step of the plan
-            last_step = instruction
+                    message = {
+                        "Goal": f"Gather enough data to accomplish the goal: {latest_content}",
+                        "Media Description": image_descriptions,
+                        "Plan": str(plan_dict),
+                        "Last Step": reflection_message,
+                        "Last Step Output": str(last_output["answer"]),
+                        "Steps Taken": str(steps_taken),
+                    }
+
+                    try:
+                        output = await user_proxy.a_initiate_chat(
+                            recipient=reflection_assistant,
+                            max_turns=1,
+                            message=f"(```{str(message)}```",
+                        )
+                        instruction_dict = json.loads(output.chat_history[-1]["content"])
+                        instruction = instruction_dict.get('step_instruction', plan_dict["steps"][min(i, len(plan_dict["steps"]) - 1)])
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Failed to parse reflection assistant response: {e}")
+                        # Fall back to next planned step
+                        instruction = plan_dict["steps"][min(i, len(plan_dict["steps"]) - 1)]
+                    except Exception as e:
+                        logging.error(f"Error during reflection assistant chat: {e}")
+                        instruction = plan_dict["steps"][min(i, len(plan_dict["steps"]) - 1)]
+
+                # Now that we have determined the next step to take, execute it
+                await self.emit_event_safe(message="Executing step: " + instruction)
+                prompt = f"Instruction: {instruction}"
+
+                if answer_output:
+                    prompt += f"\n Contextual Information: \n{answer_output}"
+
+                try:
+                    output = await user_proxy.a_initiate_chat(
+                        recipient=assistant, message=prompt
+                    )
+                except Exception as e:
+                    logging.error(f"Error executing step '{instruction}': {e}")
+                    last_output = {"answer": [f"Step execution failed: {str(e)}"], "sources": []}
+                    last_step = instruction
+                    continue
+
+                # Sort through the chat history and extract out replies from the assistant
+                assistant_replies = []
+                raw_tool_output = []
+                for chat_item in output.chat_history:
+                    try:
+                        if chat_item.get("role") == "tool":
+                            raw_tool_output.append(chat_item.get("content", ""))
+                        if chat_item.get("content") and chat_item.get("name") == "Research_Assistant":
+                            assistant_replies.append(chat_item.get("content", ""))
+                    except (KeyError, TypeError) as e:
+                        logging.warning(f"Error parsing chat item: {e}")
+                        continue
+
+                last_output = {"answer": assistant_replies, "sources": raw_tool_output}
+
+                # The previous instruction and its output will be recorded for the next iteration
+                last_step = instruction
+
+            except Exception as e:
+                logging.error(f"Error during plan step {i}: {e}")
+                await self.emit_event_safe(message=f"Error during step execution: {str(e)}")
+                continue
 
         await self.emit_event_safe(message="Summing up findings...")
         # Now that we've gathered all the information we need, we will summarize it to directly answer the original prompt
-        final_prompt = f"User's query: {plan_instruction}. Information Gathered: {answer_output}"
-        final_output = await user_proxy.a_initiate_chat(
-            message=final_prompt, max_turns=1, recipient=report_generator
-        )
-
-        return final_output.chat_history[-1]["content"]
+        try:
+            final_prompt = f"User's query: {plan_instruction}. Information Gathered: {answer_output}"
+            final_output = await user_proxy.a_initiate_chat(
+                message=final_prompt, max_turns=1, recipient=report_generator
+            )
+            return final_output.chat_history[-1]["content"]
+        except Exception as e:
+            logging.error(f"Error generating final report: {e}")
+            # Return gathered information as fallback
+            if answer_output:
+                return f"Report generation failed. Here is the raw information gathered:\n\n{str(answer_output)}"
+            return f"Unable to generate report. Error: {str(e)}"
