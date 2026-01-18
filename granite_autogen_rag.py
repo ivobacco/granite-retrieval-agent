@@ -4,12 +4,9 @@ requirements:  ag2==0.9.10, ag2[ollama]==0.9.10, ag2[openai]==0.9.10, aiohttp
 This pipe supports two LLM provider modes:
 1. Ollama (Local): Set USE_OPENROUTER=False (default)
    - Requires local Ollama instance running on http://localhost:11434
-   - Uses IBM Granite models by default
 
 2. OpenRouter (Cloud): Set USE_OPENROUTER=True
    - Requires OPENROUTER_API_KEY (get from https://openrouter.ai/)
-   - Access to 300+ models from OpenAI, Anthropic, Google, Meta, Mistral, etc.
-   - Default model: anthropic/claude-3.5-sonnet
 """
 
 from fastapi import Request
@@ -106,16 +103,6 @@ DECISION CHECKLIST (run mentally before answering)
 - Q2: Is a tool REQUIRED to fetch missing facts? If yes → make one focused tool call that will likely resolve the task.
 - Q3: After a tool call, do I have enough to answer? If yes → answer now. If not → at most 10 more targeted calls. Then either answer or terminate with a clear reason.
 
-HOMEASSISTANT TOOL DECISION CHECKLIST (run mentally before answering)
-- Q1: Do I have the `entity_id` for the target device in my Context?
-    - *No:* -> Execute **Phase 1** Search.
-    - *Yes:* -> Proceed to Q2.
-- Q2: Do I need to know the current state? (e.g., for "toggle" or "turn on if off")
-    - *Yes:* -> Call `get_entity_state`.
-    - *No:* -> Proceed to Q3.
-- Q3: Can I execute the action?
-    - *Yes:* -> Call `control` with the exact `entity_id`.
-
 ERROR & MISSING-INFO HANDLING
 - Scrutinize the returned `state` and the `attributes` dictionary. The answer is often a pre-calculated value here.
 - If inputs are vague but still permit a reasonable interpretation, make the best good-faith assumption and proceed (state assumptions briefly in the answer).
@@ -126,7 +113,7 @@ STYLE
 TOOL USE RULES
 - Use only the tools provided here. Only one tool at a time.
 - Cite from tool outputs or provided context; do not mix in outside knowledge.
-- Use the homeassistant tool with operations: search_entities (find devices by domain/pattern), get_entity_state (check current state), control (operate devices like lights, climate, media players, covers, locks, fans, vacuums, alarms, scenes), automation_config (manage automations).
+- Use the homeassistant tool with operations: search_entities (find devices by domains or rooms), get_entity_state (check current state), control (operate devices like lights, climate, media players, covers, locks, fans, vacuums, alarms, scenes), automation_config (manage automations).
 - Stop after a maximum of 5 total tool calls.
 
 EXAMPLE CHAIN OF THOUGHT FOR HOME ASSISTANT TOOL USE
