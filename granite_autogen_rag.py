@@ -1,5 +1,5 @@
 """
-requirements:  ag2==0.9.10, ag2[ollama]==0.9.10, ag2[openai]==0.9.10
+requirements:  ag2==0.9.10, ag2[ollama]==0.9.10, ag2[openai]==0.9.10, aiohttp
 
 This pipe supports two LLM provider modes:
 1. Ollama (Local): Set USE_OPENROUTER=False (default)
@@ -21,14 +21,17 @@ from open_webui import config as open_webui_config
 from pydantic import BaseModel, Field
 import json
 import logging
+import aiohttp
+import uuid
 
 ####################
 # Assistant prompts
 ####################
-PLANNER_MESSAGE = """You are a coarse-grained task planner for data gathering. You will be given a user's goal your job is to enumerate the coarse-grained steps to gather any data necessary needed to accomplish the goal.
+PLANNER_MESSAGE = """You are a coarse-grained task planner for data gathering and smart home control. You will be given a user's goal your job is to enumerate the coarse-grained steps to gather any data necessary or perform any actions needed to accomplish the goal.
 You will not execute the steps yourself, but provide the steps to a helper who will execute them. The helper has to the following tools to help them accomplish tasks:
 1. Search through a collection of documents provided by the user. These are the user's own documents and will likely not have latest news or other information you can find on the internet.
 2. Given a question/topic, search the internet for resources to address question/topic (you don't need to formulate search queries, the tool will do it for you)
+3. Control and query Home Assistant smart home devices - including lights, switches, climate/thermostats, covers/blinds, and more. Can also search for entities, get device states, and manage automations.
 Do not include steps for summarizing or synthesizing data. That will be done by another helper later, once all the data is gathered.
 
 You may use any of the capabilities that the helper has, but you do not need to use all of them if they are not required to complete the task.
@@ -59,6 +62,21 @@ Plan: [
 User Input: Retrieve all internal meeting notes and task logs related to the Alpha Project post-mortem.
 [
 "Search through the user's documents for all meeting notes and task logs related to the Alpha Project post-mortem"
+]
+
+Example 5:
+User Input: Turn off all the lights in the living room and set the thermostat to 68 degrees.
+Plan: [
+"Search for all light entities in the living room area",
+"Turn off all lights found in the living room",
+"Set the living room thermostat to 68 degrees"
+]
+
+Example 6:
+User Input: What's the current temperature in the bedroom and is the window open?
+Plan: [
+"Get the state of the bedroom temperature sensor",
+"Get the state of the bedroom window contact sensor"
 ]
 """
 
@@ -97,6 +115,7 @@ TOOL USE RULES
 - Use only the tools provided here. Only one tool at a time.
 - Cite from tool outputs or provided context; do not mix in outside knowledge.
 - Stop after a maximum of 3 total tool calls.
+- For smart home tasks, use the homeassistant tool with appropriate operations (search_entities, get_entity_state, control, automation_config).
 
 TERMINATION RULE
 - If after following the above you cannot satisfy the Instruction, output only:
@@ -116,7 +135,7 @@ You are a strict and objective judge. Your task is to determine whether the orig
 
 ## HOW TO JUDGE
 1. **Understand the Goal:** Identify what exactly is required to consider the goal fully met.
-3. **Check Information Coverage:** Verify whether the data in “Information Gathered” is:
+2. **Check Information Coverage:** Verify whether the data in “Information Gathered” is:
    - Sufficient in quantity and relevance to address the full goal;
    - Not just references to actions, but actual collected content.
 
@@ -133,10 +152,10 @@ You are a strict and objective judge. Your task is to determine whether the orig
     ```
 """
 
-REFLECTION_ASSISTANT_PROMPT = """You are a strategic planner focused on choosing the next step in a sequence of steps to achieve a given goal. 
+REFLECTION_ASSISTANT_PROMPT = """You are a strategic planner focused on choosing the next step in a sequence of steps to achieve a given goal.
 You will receive data in JSON format containing the current state of the plan and its progress.
 Your task is to determine the single next step, ensuring it aligns with the overall goal and builds upon the previous steps.
-The step will be executed by a helper that has the following capabilities: A large language model that has access to tools to search personal documents and search the web.
+The step will be executed by a helper that has the following capabilities: A large language model that has access to tools to search personal documents, search the web, and control/query Home Assistant smart home devices (lights, climate, switches, covers, sensors, automations).
 
 JSON Structure:
 {
@@ -241,6 +260,10 @@ class Pipe:
         # Common Configuration
         MODEL_TEMPERATURE: float = Field(default=0)
         MAX_PLAN_STEPS: int = Field(default=6)
+
+        # Home Assistant MCP Configuration
+        HOMEASSISTANT_MCP_URL: str = Field(default="http://localhost:3000/mcp", description="URL of the Home Assistant MCP Streamable HTTP endpoint")
+        HOMEASSISTANT_MCP_ENABLED: bool = Field(default=True, description="Enable Home Assistant MCP integration")
 
     def __init__(self):
         self.type = "pipe"
@@ -385,9 +408,10 @@ class Pipe:
 
         llm_configs = {
             "ollama_llm_config": {**base_llm_config, "config_list": [{**base_llm_config}]},
+            "assistant_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config}]},
             "planner_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": Plan}]},
             "critic_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": CriticDecision}]},
-            "reflection_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": Step}]},
+            "reflection_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": Step}]},
             "search_query_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": SearchQueries}]},
             "vision_llm_config": {
                 "config_list": [vision_config]
@@ -421,7 +445,7 @@ class Pipe:
         assistant = ConversableAgent(
             name="Research_Assistant",
             system_message=ASSISTANT_PROMPT,
-            llm_config=llm_configs["ollama_llm_config"],
+            llm_config=llm_configs["assistant_llm_config"],
             human_input_mode="NEVER",
             is_termination_msg=lambda msg: "tool_response" not in msg
             and msg["content"] == "",
@@ -579,6 +603,208 @@ class Pipe:
             except Exception as e:
                 logging.error(f"Error searching knowledge base: {e}")
                 return f"Error searching knowledge base: {str(e)}"
+
+        # Home Assistant MCP Tool
+        if self.valves.HOMEASSISTANT_MCP_ENABLED:
+            mcp_base_url = self.valves.HOMEASSISTANT_MCP_URL.rstrip('/')
+
+            # Store MCP session ID for reuse across calls
+            mcp_session_state = {"session_id": None}
+
+            async def init_mcp_session(http_session: aiohttp.ClientSession) -> str:
+                """Initialize MCP session and return session ID."""
+                if mcp_session_state["session_id"]:
+                    return mcp_session_state["session_id"]
+
+                init_payload = {
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "granite-retrieval-agent",
+                            "version": "1.0.0"
+                        }
+                    },
+                    "id": str(uuid.uuid4())
+                }
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream"
+                }
+
+                async with http_session.post(mcp_base_url, json=init_payload, headers=headers) as response:
+                    if response.status == 200:
+                        # Get session ID from response header
+                        session_id = response.headers.get("Mcp-Session-Id")
+                        if session_id:
+                            mcp_session_state["session_id"] = session_id
+                        else:
+                            # Log response for debugging
+                            result = await response.json()
+                            logging.info(f"MCP init response: {result}")
+                        return mcp_session_state["session_id"]
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to initialize MCP session: {response.status} - {error_text}")
+
+            @assistant.register_for_llm(
+                name="homeassistant",
+                description="""Control and query Home Assistant smart home devices via MCP.
+                Supports multiple operations:
+                - 'search_entities': Find devices by domain, area, state, or pattern (e.g., domain='light', area='living_room', pattern='*motion*')
+                - 'get_entity_state': Get current state of a specific entity (e.g., entity_id='sensor.temperature')
+                - 'control': Control devices with commands like turn_on, turn_off, toggle, set_temperature, set_position
+                - 'automation_config': Create, update, delete, or duplicate automations
+                Use this tool for any smart home related queries or commands."""
+            )
+            @user_proxy.register_for_execution(name="homeassistant")
+            async def do_homeassistant(
+                operation: Annotated[str, "The MCP tool operation: 'search_entities', 'get_entity_state', 'control', or 'automation_config'"],
+                entity_id: Annotated[Optional[str], "Entity ID for get_entity_state or control operations (e.g., 'light.living_room', 'climate.thermostat')"] = None,
+                command: Annotated[Optional[str], "Control command: turn_on, turn_off, toggle, open, close, stop, set_position, set_temperature, set_hvac_mode, set_fan_mode"] = None,
+                domain: Annotated[Optional[str], "Entity domain for search_entities (e.g., 'light', 'switch', 'climate', 'binary_sensor')"] = None,
+                area: Annotated[Optional[str], "Area/room name for search_entities or control (e.g., 'living_room', 'bedroom')"] = None,
+                pattern: Annotated[Optional[str], "Glob pattern for search_entities (e.g., '*motion*', '*temperature*')"] = None,
+                state: Annotated[Optional[str], "State filter for search_entities (e.g., 'on', 'off', '>50')"] = None,
+                brightness: Annotated[Optional[int], "Brightness level 0-255 for light control"] = None,
+                temperature: Annotated[Optional[float], "Target temperature for climate control"] = None,
+                hvac_mode: Annotated[Optional[str], "HVAC mode: off, heat, cool, heat_cool, auto, dry, fan_only"] = None,
+                position: Annotated[Optional[int], "Position 0-100 for cover control"] = None,
+                rgb_color: Annotated[Optional[list], "RGB color as [r, g, b] for light control"] = None,
+                automation_action: Annotated[Optional[str], "Automation action: create, update, delete, duplicate"] = None,
+                automation_id: Annotated[Optional[str], "Automation ID for update/delete/duplicate operations"] = None,
+                automation_config: Annotated[Optional[dict], "Automation configuration for create/update operations"] = None,
+            ) -> str:
+                """Execute Home Assistant MCP operations for smart home control and queries."""
+
+                try:
+                    async with aiohttp.ClientSession() as http_session:
+                        # Initialize MCP session first
+                        session_id = await init_mcp_session(http_session)
+
+                        # Build the request based on operation type
+                        if operation == "search_entities":
+                            tool_name = "search_entities"
+                            arguments = {}
+                            if domain:
+                                arguments["domain"] = domain
+                            if area:
+                                arguments["area"] = area
+                            if pattern:
+                                arguments["pattern"] = pattern
+                            if state:
+                                arguments["state"] = state
+                            arguments["output"] = "summary"
+
+                        elif operation == "get_entity_state":
+                            if not entity_id:
+                                return "Error: entity_id is required for get_entity_state operation"
+                            tool_name = "get_entity_state"
+                            arguments = {
+                                "entity_id": entity_id,
+                                "include_attributes": True
+                            }
+
+                        elif operation == "control":
+                            if not command:
+                                return "Error: command is required for control operation"
+                            tool_name = "control"
+                            arguments = {"command": command}
+                            if entity_id:
+                                arguments["entity_id"] = entity_id
+                            if area:
+                                arguments["area_id"] = area
+                            if brightness is not None:
+                                arguments["brightness"] = brightness
+                            if temperature is not None:
+                                arguments["temperature"] = temperature
+                            if hvac_mode:
+                                arguments["hvac_mode"] = hvac_mode
+                            if position is not None:
+                                arguments["position"] = position
+                            if rgb_color:
+                                arguments["rgb_color"] = rgb_color
+
+                        elif operation == "automation_config":
+                            if not automation_action:
+                                return "Error: automation_action is required for automation_config operation"
+                            tool_name = "automation_config"
+                            arguments = {"action": automation_action}
+                            if automation_id:
+                                arguments["automation_id"] = automation_id
+                            if automation_config:
+                                arguments["config"] = automation_config
+                        else:
+                            return f"Error: Unknown operation '{operation}'. Use 'search_entities', 'get_entity_state', 'control', or 'automation_config'."
+
+                        # Make the MCP tool call via Streamable HTTP (JSON-RPC format)
+                        request_id = str(uuid.uuid4())
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "method": "tools/call",
+                            "params": {
+                                "name": tool_name,
+                                "arguments": arguments
+                            },
+                            "id": request_id
+                        }
+
+                        headers = {
+                            "Content-Type": "application/json",
+                            "Accept": "application/json, text/event-stream"
+                        }
+                        if session_id:
+                            headers["Mcp-Session-Id"] = session_id
+
+                        logging.info(f"Calling Home Assistant MCP: {tool_name} with args {arguments}")
+
+                        async with http_session.post(mcp_base_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            # Update session ID if returned in response
+                            new_session_id = response.headers.get("Mcp-Session-Id")
+                            if new_session_id:
+                                mcp_session_state["session_id"] = new_session_id
+
+                            if response.status == 200:
+                                content_type = response.headers.get("Content-Type", "")
+                                if "text/event-stream" in content_type:
+                                    # Handle SSE response
+                                    result_text = ""
+                                    async for line in response.content:
+                                        line = line.decode("utf-8").strip()
+                                        if line.startswith("data:"):
+                                            data = line[5:].strip()
+                                            if data:
+                                                try:
+                                                    event_data = json.loads(data)
+                                                    if "result" in event_data:
+                                                        return json.dumps(event_data["result"], indent=2)
+                                                    elif "error" in event_data:
+                                                        return f"MCP Error: {json.dumps(event_data['error'])}"
+                                                except json.JSONDecodeError:
+                                                    result_text += data
+                                    return result_text if result_text else "No response from MCP"
+                                else:
+                                    # Handle regular JSON response
+                                    result = await response.json()
+                                    if "result" in result:
+                                        return json.dumps(result["result"], indent=2)
+                                    elif "error" in result:
+                                        return f"MCP Error: {json.dumps(result['error'])}"
+                                    return json.dumps(result, indent=2)
+                            else:
+                                error_text = await response.text()
+                                logging.error(f"Home Assistant MCP error: {response.status} - {error_text}")
+                                return f"Error from Home Assistant MCP: {response.status} - {error_text}"
+
+                except aiohttp.ClientError as e:
+                    logging.error(f"HTTP error calling Home Assistant MCP: {e}")
+                    return f"Connection error to Home Assistant MCP: {str(e)}. Ensure the MCP server is running at {mcp_base_url}"
+                except Exception as e:
+                    logging.error(f"Error calling Home Assistant MCP: {e}")
+                    return f"Error calling Home Assistant MCP: {str(e)}"
 
         #########################
         # Begin Agentic Workflow
