@@ -27,11 +27,11 @@ import uuid
 ####################
 # Assistant prompts
 ####################
-PLANNER_MESSAGE = """You are a coarse-grained task planner for data gathering and smart home control. You will be given a user's goal your job is to enumerate the coarse-grained steps to gather any data necessary or perform any actions needed to accomplish the goal.
-You will not execute the steps yourself, but provide the steps to a helper who will execute them. The helper has to the following tools to help them accomplish tasks:
-1. Search through a collection of documents provided by the user. These are the user's own documents and will likely not have latest news or other information you can find on the internet.
-2. Given a question/topic, search the internet for resources to address question/topic (you don't need to formulate search queries, the tool will do it for you)
-3. Control and query Home Assistant smart home devices - including lights, switches, climate/thermostats, covers/blinds, and more. Can also search for entities, get device states, and manage automations.
+PLANNER_MESSAGE = """You are a coarse-grained task planner for data gathering and smart home control. You will be given a user's goal; your job is to enumerate the coarse-grained steps to gather any data necessary or perform any actions needed to accomplish the goal.
+You will not execute the steps yourself, but provide the steps to a helper who will execute them. The helper has the following tools to help them accomplish tasks:
+1. Control and query Home Assistant smart home devices - including lights, climate, media players, covers, locks, fans, vacuums, alarms, scenes, and automations. Can search for entities, get device states, control devices, and manage automations.
+2. Search through a collection of documents provided by the user. These are the user's own documents and will likely not have latest news or other information you can find on the internet.
+3. Given a question/topic, search the internet for resources to address question/topic (you don't need to formulate search queries, the tool will do it for you)
 Do not include steps for summarizing or synthesizing data. That will be done by another helper later, once all the data is gathered.
 
 You may use any of the capabilities that the helper has, but you do not need to use all of them if they are not required to complete the task.
@@ -58,9 +58,9 @@ Plan: [
 "Search the internet for information about government incentive programs for electric vehicles in European countries"
 ]
 
-
+Example 4:
 User Input: Retrieve all internal meeting notes and task logs related to the Alpha Project post-mortem.
-[
+Plan: [
 "Search through the user's documents for all meeting notes and task logs related to the Alpha Project post-mortem"
 ]
 
@@ -98,7 +98,7 @@ STRUCTURE & OUTPUT
 - Always produce one of:
   a) ##ANSWER## <your final answer>   (no headers before it)
   b) ##TERMINATE##   (only if truly impossible to complete)
-- If using tools or provided excerpts as sources, include a brief "Sources:" line with identifiers (e.g., [1], [2]) that map to the Contextual Information or tool-returned items.
+- If using tools or provided excerpts as sources, include a very brief without full details "Sources:" line with identifiers (e.g., [1], [2]) that map to the Contextual Information or tool-returned items.
 
 DECISION CHECKLIST (run mentally before answering)
 - Q1: Can I answer directly from Instruction + Contextual Information? If yes → answer now (no tools).
@@ -114,8 +114,8 @@ STYLE
 TOOL USE RULES
 - Use only the tools provided here. Only one tool at a time.
 - Cite from tool outputs or provided context; do not mix in outside knowledge.
-- Stop after a maximum of 3 total tool calls.
-- For smart home tasks, use the homeassistant tool with appropriate operations (search_entities, get_entity_state, control, automation_config).
+- Use the homeassistant tool with operations: search_entities (find devices by domain/area/pattern), get_entity_state (check current state), control (operate devices like lights, climate, media players, covers, locks, fans, vacuums, alarms, scenes), automation_config (manage automations).
+- Stop after a maximum of 5 total tool calls.
 
 TERMINATION RULE
 - If after following the above you cannot satisfy the Instruction, output only:
@@ -155,7 +155,9 @@ You are a strict and objective judge. Your task is to determine whether the orig
 REFLECTION_ASSISTANT_PROMPT = """You are a strategic planner focused on choosing the next step in a sequence of steps to achieve a given goal.
 You will receive data in JSON format containing the current state of the plan and its progress.
 Your task is to determine the single next step, ensuring it aligns with the overall goal and builds upon the previous steps.
-The step will be executed by a helper that has the following capabilities: A large language model that has access to tools to search personal documents, search the web, and control/query Home Assistant smart home devices (lights, climate, switches, covers, sensors, automations).
+The step will be executed by different helpers that have the following capabilities: 
+- access to tools to search personal documents or to search the web
+- access to homeassistant tool that can control and query homeassistant smart home devices
 
 JSON Structure:
 {
@@ -178,15 +180,30 @@ Restrictions:
 2. Limit your response to a single step or instruction.
     """
 
-STEP_CRITIC_PROMPT = """The previous instruction was {last_step} \nThe following is the output of that instruction.
-    if the output of the instruction completely satisfies the instruction, then reply with True for the decision and an explanation why.
-    For example, if the instruction is to list companies that use AI, then the output contains a list of companies that use AI.
-    If the output contains the phrase 'I'm sorry but...' then it is likely not fulfilling the instruction. \n
-    If the output of the instruction does not properly satisfy the instruction, then reply with False for the decision and the reason why.
-    For example, if the instruction was to list companies that use AI but the output does not contain a list of companies, or states that a list of companies is not available, then the output did not properly satisfy the instruction.
-    If it does not satisfy the instruction, please think about what went wrong with the previous instruction and give me an explanation along with a False for the decision. \n
-    Remember to always provide both a decision and an explanation.
-    Previous step output: \n {last_output}"""
+STEP_CRITIC_PROMPT = """The previous instruction was {last_step}
+The following is the output of that instruction.
+
+EVALUATION CRITERIA:
+- If the output completely satisfies the instruction, reply with True for the decision and an explanation why.
+- If the output does not properly satisfy the instruction, reply with False for the decision and the reason why.
+
+SUCCESS EXAMPLES:
+- Instruction: "List companies that use AI" → Output contains a list of companies → True
+- Instruction: "Get the bedroom temperature" → Output shows temperature reading → True
+- Instruction: "Turn off living room lights" → Output confirms lights turned off → True
+
+FAILURE EXAMPLES:
+- Output contains "I'm sorry but..." → Likely not fulfilling the instruction → False
+- Instruction: "List companies that use AI" → Output says "no companies found" or "list not available" → False
+- Instruction: "Search for bedroom lights" → Output says "no devices found" → False (if user asks for something, it likely exists; search parameters may need refinement)
+- Instruction: "Get thermostat history" → Output returns empty/no data → False (entities likely exist; may need different query approach)
+
+IMPORTANT: If the user's instruction implies something should exist (e.g., asking for bedroom lights, thermostat data, device history), it likely does: 
+- It may contain devices of same domain, class or type, but with similar names (e.g., italian names instead of english ones)
+- If The output returns empty/not found, this is likely a FAILED step. The query may need to be reformulated by focusing search on areas, or domains, or blob names patterns.
+
+Remember to always provide both a decision and an explanation.
+Previous step output: \n {last_output}"""
 
 
 SEARCH_QUERY_GENERATION_PROMPT = """You are a search query generation assistant.
@@ -213,7 +230,7 @@ Expected Output:
 
 REPORT_WRITER_PROMPT = """
 You are a precise and well-structured report writer.
-Your task is to summarize the information provided to you in order to directly answer the user’s instruction or query.
+Your task is to summarize the information provided to you in order to directly answer the user's instruction or query.
 
 Guidelines:
 
@@ -221,10 +238,10 @@ Guidelines:
 2. Organize the report into clear sections with headings when appropriate.
 3. For every statement, fact, or claim that is derived from a specific source, **cite it with an explicit hyperlink** to the original URL. Use Markdown citation format like this:
 
-   * Example: “The system achieved state-of-the-art results [source](https://example.com/article).”
+   * Example: "The system achieved state-of-the-art results [source](https://example.com/article)."
 4. If multiple sources support a point, you may cite more than one.
 5. If some information is repeated across multiple sources, summarize it concisely without redundancy.
-6. If the provided information does not fully answer the user’s query, clearly state what is missing, but do not invent new details.
+6. If the provided information does not fully answer the user's query, clearly state what is missing, but do not invent new details.
 7. Maintain a neutral, factual tone — avoid speculation, exaggeration, or opinion.
 
 Output Format:
@@ -232,11 +249,14 @@ Output Format:
 * Begin with a short **executive summary** that directly answers the query.
 * Follow with supporting details structured in sections and paragraphs.
 * Include hyperlinks inline with each reference.
+* If Home Assistant tool calls were made, add a **"Home Assistant"** section at the end showing:
+  - What devices/entities were controlled or queried
+  - What actions taken and results of those actions
 
 Important:
 
 * Do not include any sources or information not explicitly provided.
-* Do not use vague references like “according to a website” — always hyperlink.
+* Do not use vague references like "according to a website" — always hyperlink.
 * If no sources are relevant, say so explicitly.
 """
 class Pipe:
@@ -408,9 +428,9 @@ class Pipe:
 
         llm_configs = {
             "ollama_llm_config": {**base_llm_config, "config_list": [{**base_llm_config}]},
-            "assistant_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config}]},
+            "assistant_llm_config": {**base_llm_config, "config_list": [{**base_llm_config}]},
             "planner_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": Plan}]},
-            "critic_llm_config": {**base_llm_config, "config_list": [{**base_llm_config, "response_format": CriticDecision}]},
+            "critic_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": CriticDecision}]},
             "reflection_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": Step}]},
             "search_query_llm_config": {**base_llm_config, "config_list": [{**quick_llm_config, "response_format": SearchQueries}]},
             "vision_llm_config": {
@@ -652,28 +672,77 @@ class Pipe:
 
             @assistant.register_for_llm(
                 name="homeassistant",
-                description="""Control and query Home Assistant smart home devices via MCP.
-                Supports multiple operations:
-                - 'search_entities': Find devices by domain, area, state, or pattern (e.g., domain='light', area='living_room', pattern='*motion*')
-                - 'get_entity_state': Get current state of a specific entity (e.g., entity_id='sensor.temperature')
-                - 'control': Control devices with commands like turn_on, turn_off, toggle, set_temperature, set_position
-                - 'automation_config': Create, update, delete, or duplicate automations
-                Use this tool for any smart home related queries or commands."""
+                description="""Control and query Home Assistant smart home devices via MCP. Supports different operations:
+
+1. search_entities - Find devices/entities using filters:
+   - domain: 'light', 'climate', 'binary_sensor', etc.
+   - device_class: 'motion', 'door', 'temperature', etc.
+   - area: 'living_room', 'bedroom', etc.
+   - pattern: glob pattern like '*motion*', '*bedroom*'
+   - state: exact or comparison like 'on', '>50', '!=unavailable'
+   - attributes: list of {key, op, value} filters
+   - changed_within: '5m', '1h', '24h'
+   - changed_after: ISO timestamp
+   - output: 'minimal', 'summary', 'full'
+   - sort_by: 'last_changed', 'last_updated', 'entity_id', 'state'
+   - sort_order: 'asc', 'desc'
+   - limit: max results number
+   COMBINE multiple filters for better results (e.g., domain + pattern or area + domain).
+
+2. get_entity_state - Get state of specific entity:
+   - entity_id: required (e.g., 'sensor.bedroom_temperature')
+   - include_attributes: true/false (default true)
+
+3. control - Control devices:
+   - command: required (turn_on, turn_off, toggle, open, close, stop, set_position, set_tilt_position, set_temperature, set_hvac_mode, set_fan_mode, set_humidity)
+   - entity_id OR area_id: target device or area (at least one required)
+   - state: desired state
+   - Light: brightness (0-255), color_temp, rgb_color [r,g,b]
+   - Cover: position (0-100), tilt_position (0-100)
+   - Climate: temperature, target_temp_high, target_temp_low, hvac_mode (off|heat|cool|heat_cool|auto|dry|fan_only), fan_mode (auto|low|medium|high), humidity (0-100)
+
+4. automation_config - Manage automations:
+   - automation_action: required (create, update, delete, duplicate)
+   - automation_id: for update/delete/duplicate
+   - automation_config: dict for create/update
+
+Include ALL relevant parameters from the user's request."""
             )
             @user_proxy.register_for_execution(name="homeassistant")
             async def do_homeassistant(
                 operation: Annotated[str, "The MCP tool operation: 'search_entities', 'get_entity_state', 'control', or 'automation_config'"],
+                # Common parameters
                 entity_id: Annotated[Optional[str], "Entity ID for get_entity_state or control operations (e.g., 'light.living_room', 'climate.thermostat')"] = None,
-                command: Annotated[Optional[str], "Control command: turn_on, turn_off, toggle, open, close, stop, set_position, set_temperature, set_hvac_mode, set_fan_mode"] = None,
-                domain: Annotated[Optional[str], "Entity domain for search_entities (e.g., 'light', 'switch', 'climate', 'binary_sensor')"] = None,
-                area: Annotated[Optional[str], "Area/room name for search_entities or control (e.g., 'living_room', 'bedroom')"] = None,
+                # search_entities parameters
+                domain: Annotated[Optional[str], "Domain filter for search_entities (e.g., 'light', 'switch', 'climate', 'binary_sensor')"] = None,
+                device_class: Annotated[Optional[str], "Device class filter for search_entities (e.g., 'motion', 'door', 'temperature')"] = None,
+                area: Annotated[Optional[str], "Area filter for search_entities (e.g., 'living_room', 'bedroom')"] = None,
                 pattern: Annotated[Optional[str], "Glob pattern for search_entities (e.g., '*motion*', '*temperature*')"] = None,
-                state: Annotated[Optional[str], "State filter for search_entities (e.g., 'on', 'off', '>50')"] = None,
+                state: Annotated[Optional[str], "State filter for search_entities (e.g., 'on', 'off', '>50', '!=unavailable')"] = None,
+                attributes: Annotated[Optional[list], "Attribute filters for search_entities as list of dicts with key, op, value"] = None,
+                changed_within: Annotated[Optional[str], "Duration filter for search_entities (e.g., '5m', '1h', '24h')"] = None,
+                changed_after: Annotated[Optional[str], "ISO timestamp filter for search_entities"] = None,
+                output: Annotated[Optional[str], "Output format for search_entities: 'minimal', 'summary', or 'full'"] = "summary",
+                sort_by: Annotated[Optional[str], "Sort field for search_entities: 'last_changed', 'last_updated', 'entity_id', or 'state'"] = None,
+                sort_order: Annotated[Optional[str], "Sort order for search_entities: 'asc' or 'desc'"] = None,
+                limit: Annotated[Optional[int], "Maximum results for search_entities"] = None,
+                # get_entity_state parameters
+                include_attributes: Annotated[Optional[bool], "Include entity attributes in get_entity_state response"] = True,
+                # control parameters
+                command: Annotated[Optional[str], "Control command: turn_on, turn_off, toggle, open, close, stop, set_position, set_tilt_position, set_temperature, set_hvac_mode, set_fan_mode, set_humidity"] = None,
+                area_id: Annotated[Optional[str], "Area ID for control operations to control all devices in area"] = None,
                 brightness: Annotated[Optional[int], "Brightness level 0-255 for light control"] = None,
-                temperature: Annotated[Optional[float], "Target temperature for climate control"] = None,
-                hvac_mode: Annotated[Optional[str], "HVAC mode: off, heat, cool, heat_cool, auto, dry, fan_only"] = None,
-                position: Annotated[Optional[int], "Position 0-100 for cover control"] = None,
+                color_temp: Annotated[Optional[int], "Color temperature for light control"] = None,
                 rgb_color: Annotated[Optional[list], "RGB color as [r, g, b] for light control"] = None,
+                position: Annotated[Optional[int], "Position 0-100 for cover control"] = None,
+                tilt_position: Annotated[Optional[int], "Tilt position 0-100 for cover control"] = None,
+                temperature: Annotated[Optional[float], "Target temperature for climate control"] = None,
+                target_temp_high: Annotated[Optional[float], "Target high temperature for climate control"] = None,
+                target_temp_low: Annotated[Optional[float], "Target low temperature for climate control"] = None,
+                hvac_mode: Annotated[Optional[str], "HVAC mode: off, heat, cool, heat_cool, auto, dry, fan_only"] = None,
+                fan_mode: Annotated[Optional[str], "Fan mode: auto, low, medium, high"] = None,
+                humidity: Annotated[Optional[int], "Target humidity 0-100 for climate control"] = None,
+                # automation_config parameters
                 automation_action: Annotated[Optional[str], "Automation action: create, update, delete, duplicate"] = None,
                 automation_id: Annotated[Optional[str], "Automation ID for update/delete/duplicate operations"] = None,
                 automation_config: Annotated[Optional[dict], "Automation configuration for create/update operations"] = None,
@@ -691,13 +760,28 @@ class Pipe:
                             arguments = {}
                             if domain:
                                 arguments["domain"] = domain
+                            if device_class:
+                                arguments["device_class"] = device_class
                             if area:
                                 arguments["area"] = area
                             if pattern:
                                 arguments["pattern"] = pattern
                             if state:
                                 arguments["state"] = state
-                            arguments["output"] = "summary"
+                            if attributes:
+                                arguments["attributes"] = attributes
+                            if changed_within:
+                                arguments["changed_within"] = changed_within
+                            if changed_after:
+                                arguments["changed_after"] = changed_after
+                            if output:
+                                arguments["output"] = output
+                            if sort_by:
+                                arguments["sort_by"] = sort_by
+                            if sort_order:
+                                arguments["sort_order"] = sort_order
+                            if limit:
+                                arguments["limit"] = limit
 
                         elif operation == "get_entity_state":
                             if not entity_id:
@@ -705,7 +789,7 @@ class Pipe:
                             tool_name = "get_entity_state"
                             arguments = {
                                 "entity_id": entity_id,
-                                "include_attributes": True
+                                "include_attributes": include_attributes
                             }
 
                         elif operation == "control":
@@ -713,20 +797,39 @@ class Pipe:
                                 return "Error: command is required for control operation"
                             tool_name = "control"
                             arguments = {"command": command}
+                            # Target selection (at least one required)
                             if entity_id:
                                 arguments["entity_id"] = entity_id
-                            if area:
-                                arguments["area_id"] = area
+                            if area_id:
+                                arguments["area_id"] = area_id
+                            # Common parameters
+                            if state:
+                                arguments["state"] = state
+                            # Light control parameters
                             if brightness is not None:
                                 arguments["brightness"] = brightness
-                            if temperature is not None:
-                                arguments["temperature"] = temperature
-                            if hvac_mode:
-                                arguments["hvac_mode"] = hvac_mode
-                            if position is not None:
-                                arguments["position"] = position
+                            if color_temp is not None:
+                                arguments["color_temp"] = color_temp
                             if rgb_color:
                                 arguments["rgb_color"] = rgb_color
+                            # Cover control parameters
+                            if position is not None:
+                                arguments["position"] = position
+                            if tilt_position is not None:
+                                arguments["tilt_position"] = tilt_position
+                            # Climate control parameters
+                            if temperature is not None:
+                                arguments["temperature"] = temperature
+                            if target_temp_high is not None:
+                                arguments["target_temp_high"] = target_temp_high
+                            if target_temp_low is not None:
+                                arguments["target_temp_low"] = target_temp_low
+                            if hvac_mode:
+                                arguments["hvac_mode"] = hvac_mode
+                            if fan_mode:
+                                arguments["fan_mode"] = fan_mode
+                            if humidity is not None:
+                                arguments["humidity"] = humidity
 
                         elif operation == "automation_config":
                             if not automation_action:
