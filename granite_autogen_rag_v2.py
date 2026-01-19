@@ -32,7 +32,9 @@ import aiohttp
 import uuid
 import sys
 
+
 # V2 imports
+V2_AVAILABLE = False
 try:
     if '/app/backend' not in sys.path:
         sys.path.insert(0, '/app/backend')
@@ -44,8 +46,9 @@ try:
     )
     from v2.prompts import PLANNER_MESSAGE, ASSISTANT_PROMPT, HA_PLANNER_PROMPT, REPORT_WRITER_PROMPT
     V2_AVAILABLE = True
+    logging.info("V2 modules loaded successfully")
 except ImportError as e:
-    logging.warning(f"V2 modules not available: {e}")
+    logging.warning(f"V2 modules not available: {e}. Falling back to V1.")
     V2_AVAILABLE = False
     # Fallback: Use V1 prompts if V2 not available
     # V1 prompts will be defined below
