@@ -37,7 +37,7 @@ import sys
 V2_AVAILABLE = False
 try:
     if '/app/backend' not in sys.path:
-        sys.path.insert(0, '/app/backend')
+        sys.path.append('/app/backend')
     from v2 import (
         GraniteOrchestrator,
         ContextVariables,
